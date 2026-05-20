@@ -1,0 +1,6 @@
+node_modules/
+.env
+.env.local
+lastBlock.txt
+*.log
+npm-debug.log*

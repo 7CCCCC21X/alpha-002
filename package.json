@@ -1,0 +1,17 @@
+{
+  "name": "bsc-initpool-tg-bot",
+  "version": "1.0.0",
+  "description": "BSC on-chain initializePool listener that pushes alerts to Telegram",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0"
+  }
+}
