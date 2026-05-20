@@ -41,16 +41,12 @@ const {
   CURSOR_FILE = "./lastBlock.txt",
   POOLS_FILE = "./pools.json",
   RPC_TIMEOUT_MS = "15000",
-  // 是否显示 Hooks / PoolManager / Parameters / sqrtPriceX96 等底层调试字段
-  SHOW_DEBUG_FIELDS = "false",
   // 消息结尾的社群引流（留空 COMMUNITY_URL 则不显示）
   COMMUNITY_NAME = "小C聊天群",
   COMMUNITY_URL = "https://t.me/xiaoc236",
   // 控制命令白名单（TG 用户 ID，逗号分隔）。留空 = 没人能控制。
   WHITELIST_IDS = ""
 } = process.env;
-
-const showDebugFields = String(SHOW_DEBUG_FIELDS) === "true";
 
 // 消息结尾的社群引流页脚（告警 / 预览都会带上）
 function communityFooter() {
@@ -256,7 +252,7 @@ function isTargetTx(tx) {
 
 // ---------------- 消息构造 ----------------
 
-async function buildAlertMessage(tx, blockNumber, parsed, receipt, { detailed = false } = {}) {
+async function buildAlertMessage(tx, blockNumber, parsed, receipt) {
   const key = parsed.args.key ?? parsed.args[0];
   const inputCurrency0 = ethers.getAddress(key.currency0 ?? key[0]);
   const inputCurrency1 = ethers.getAddress(key.currency1 ?? key[1]);
@@ -322,36 +318,16 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt, { detailed = 
     );
   }
   lines.push(
+    `🪙 <b>${escapeHtml(t0.symbol)} 合约：</b><code>${currency0}</code>`,
+    `💵 <b>${escapeHtml(t1.symbol)} 合约：</b><code>${currency1}</code>`,
+    ``,
     `⏰ <b>开始时间：</b>${escapeHtml(formatUiTime(startTimestamp, TIMEZONE))}`,
     `🧩 <b>PoolId：</b><code>${shortPoolId(poolId)}</code>`,
     `📦 <b>区块：</b><code>${blockNumber}</code>`,
     `🔎 <b>Tx：</b><a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`
   );
-  if (detailed) {
-    lines.push(
-      ``,
-      `🛠 <b>详细</b>`,
-      `手续费: <code>${fee.toString()}</code>，约 ${feeToPercent(fee)}`,
-      `完整 PoolId: <code>${poolId}</code>`,
-      `From: <code>${ethers.getAddress(tx.from)}</code>`,
-      `Token0: <code>${currency0}</code>`,
-      `Token1: <code>${currency1}</code>`,
-      `Hooks: <code>${hooks}</code>`,
-      `PoolManager: <code>${poolManager}</code>`,
-      `Parameters: <code>${parameters}</code>`,
-      `sqrtPriceX96: <code>${sqrtPriceX96.toString()}</code>`,
-      `poolId 来源: ${realInit ? "Initialize 事件" : hookStarted ? "Hook 事件" : "入参计算（回退）"}`
-    );
-  }
 
-  const reply_markup = buildPoolKeyboard({
-    poolId,
-    txHash: tx.hash,
-    secondRow: [
-      { text: `🪙 ${t0.symbol || "Token0"}`, url: bscscanTokenUrl(t0.address) },
-      { text: `💵 ${t1.symbol || "Token1"}`, url: bscscanTokenUrl(t1.address) }
-    ]
-  });
+  const reply_markup = buildPoolKeyboard({ poolId, txHash: tx.hash });
 
   return {
     text: lines.join("\n") + communityFooter(),
@@ -363,7 +339,7 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt, { detailed = 
   };
 }
 
-async function buildAddOwnersMessage(tx, blockNumber, parsed, { detailed = false } = {}) {
+async function buildAddOwnersMessage(tx, blockNumber, parsed) {
   const poolId = String(parsed.args.poolId ?? parsed.args[0]).toLowerCase();
   const owners = (parsed.args.owners ?? parsed.args[1] ?? []).map((a) => ethers.getAddress(a));
   const cached = poolCache.get(poolId);
@@ -395,14 +371,6 @@ async function buildAddOwnersMessage(tx, blockNumber, parsed, { detailed = false
       `<i>（本地无该池初始化记录，可用 /import &lt;initializePool 交易哈希&gt; 补全币对）</i>`
     );
   }
-  if (detailed) {
-    lines.push(
-      ``,
-      `🛠 <b>详细</b>`,
-      `调用者: <code>${ethers.getAddress(tx.from)}</code>`,
-      `完整 PoolId: <code>${poolId}</code>`
-    );
-  }
 
   const reply_markup = buildPoolKeyboard({
     poolId,
@@ -416,10 +384,10 @@ async function buildAddOwnersMessage(tx, blockNumber, parsed, { detailed = false
   return { text: lines.join("\n") + communityFooter(), reply_markup, pair, poolId };
 }
 
-async function buildMessageForMethod(method, tx, blockNumber, parsed, receipt, opts = {}) {
+async function buildMessageForMethod(method, tx, blockNumber, parsed, receipt) {
   return method === "addPoolOwners"
-    ? buildAddOwnersMessage(tx, blockNumber, parsed, opts)
-    : buildAlertMessage(tx, blockNumber, parsed, receipt, opts);
+    ? buildAddOwnersMessage(tx, blockNumber, parsed)
+    : buildAlertMessage(tx, blockNumber, parsed, receipt);
 }
 
 // /pool 信息卡片
@@ -545,7 +513,7 @@ async function buildPreviewSample() {
     to: targetContract,
     data
   };
-  const m = await buildAlertMessage(sampleTx, "（示例）", parsed, null, { detailed: true });
+  const m = await buildAlertMessage(sampleTx, "（示例）", parsed, null);
   return { text: `🔎 <b>预览示例（非真实告警）</b>\n\n${m.text}`, reply_markup: m.reply_markup };
 }
 
@@ -577,16 +545,7 @@ async function buildPreviewForTx(txHash) {
             "getTransactionReceipt"
           ).catch(() => null)
         : null;
-    const m = await buildMessageForMethod(
-      method,
-      tx,
-      tx.blockNumber ?? "pending",
-      parsed,
-      receipt,
-      {
-        detailed: true
-      }
-    );
+    const m = await buildMessageForMethod(method, tx, tx.blockNumber ?? "pending", parsed, receipt);
     return { text: `🔎 <b>预览（真实交易）</b>\n\n${m.text}`, reply_markup: m.reply_markup };
   } catch (err) {
     return { text: `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>` };
@@ -650,10 +609,7 @@ async function buildHitCheck(txHash) {
         tx,
         tx.blockNumber ?? "pending",
         parsed,
-        receipt,
-        {
-          detailed: true
-        }
+        receipt
       );
       return {
         text: `${lines.join("\n")}\n\n— — — 推送内容 — — —\n${m.text}`,
@@ -997,9 +953,7 @@ async function scanBlock(blockNumber) {
     let built;
     try {
       const parsed = iface.parseTransaction({ data: tx.input || tx.data, value: tx.value ?? 0 });
-      built = await buildMessageForMethod(method, tx, blockNumber, parsed, receipt, {
-        detailed: showDebugFields
-      });
+      built = await buildMessageForMethod(method, tx, blockNumber, parsed, receipt);
     } catch (err) {
       console.error(`解析 ${method} 失败:`, tx.hash, err);
       continue;

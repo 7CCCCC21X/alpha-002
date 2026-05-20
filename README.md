@@ -15,7 +15,7 @@
 
 | 方法 | 选择器 | 推送内容 |
 |---|---|---|
-| `initializePool(PoolKey key, uint256 startTimestamp, uint160 sqrtPriceX96)` | `0x57c036db` | 🟢 新池：币对、双向价格、Fee、PoolId、PancakeSwap 链接、Token0/1、Hooks、PoolManager、开始时间 |
+| `initializePool(PoolKey key, uint256 startTimestamp, uint160 sqrtPriceX96)` | `0x57c036db` | 🚨 上线前信号：币对、状态、双向价格、Token0/1 合约地址、开始时间、PoolId、区块、Tx |
 | `addPoolOwners(bytes32 poolId, address[] owners)` | `0xfe7815ed` | 🟠 加管理员：PoolId、PancakeSwap 链接、新增 Owners、调用者（缓存命中时补充币对/Fee） |
 
 ### poolId 以链上事件为准（重要）
@@ -112,7 +112,6 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `MAX_BLOCKS_PER_TICK` | | `40` | 单次最多扫多少块，防积压 |
 | `CONFIRMATIONS` | | `3` | 扫块确认数，避免链重组；只扫 `latest - N` 之前的块 |
 | `RPC_TIMEOUT_MS` | | `15000` | 单次 RPC 调用超时（毫秒） |
-| `SHOW_DEBUG_FIELDS` | | `false` | 是否显示 From / Hooks / PoolManager / Parameters / sqrtPriceX96 等底层字段 |
 | `COMMUNITY_NAME` | | `小C聊天群` | 消息结尾引流的群名（可点击的文字） |
 | `COMMUNITY_URL` | | `https://t.me/xiaoc236` | 群名指向的链接；留空则不显示页脚 |
 | `TIMEZONE` | | `Asia/Taipei` | 时间显示用的时区 |
@@ -167,9 +166,9 @@ railway.json      Railway 部署配置
 
 ## 告警样式
 
-正式推送主打「Binance Alpha 上线前信号」，只展示用户第一眼需要的：币对、状态、价格、开始时间、
-PoolId（精简）、区块、Tx + 按钮。手续费 / From / Hooks / PoolManager / Parameters / sqrtPriceX96
-等技术字段**只在 `/check`、`/preview`（detailed）里显示**，或在生产里设 `SHOW_DEBUG_FIELDS=true` 才追加。
+正式推送主打「Binance Alpha 上线前信号」，只展示用户第一眼需要的：币对、状态、价格、**代币合约地址**、
+开始时间、PoolId（精简）、区块、Tx + 按钮。代币合约直接放在正文里（`<code>` 可一键复制）。
+不再显示手续费 / From / Hooks / PoolManager / Parameters / sqrtPriceX96 等技术字段。
 
 `initializePool`：
 
@@ -179,13 +178,14 @@ PoolId（精简）、区块、Tx + 按钮。手续费 / From / Hooks / PoolManag
 💰 初始价格
 1 NEX ≈ 0.0000015 USDT
 1 USDT ≈ 666,666.67 NEX
+🪙 NEX 合约：0x365DE036A1F7dcCb621530d517133521debB2013
+💵 USDT 合约：0x55d398326f99059fF775485246999027B3197955
 ⏰ 开始时间：2026/05/20 22:00 北京
 🧩 PoolId：0xae74941d...8ec41abd
 📦 区块：99031467
 🔎 Tx：0x6b5b...d830
 👥 加入小C聊天群 获取最新币安Alpha消息
 [🥞 Alpha 池子] [🔎 BscScan Tx]
-[🪙 NEX] [💵 USDT]
 ```
 
 `addPoolOwners`（会回复到上面那条初始化消息）：
