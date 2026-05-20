@@ -46,7 +46,7 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 // ethers 的 Provider 是只读链上连接，可查询 block / transaction / receipt 等信息。
 // 这里不用发交易，只扫描新区块。
 
-const INIT_POOL_ABI = [
+const HOOK_ABI = [
   {
     type: "function",
     name: "initializePool",
@@ -68,6 +68,16 @@ const INIT_POOL_ABI = [
       { name: "sqrtPriceX96", type: "uint160" }
     ],
     outputs: []
+  },
+  {
+    type: "function",
+    name: "addPoolOwners",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "poolId", type: "bytes32" },
+      { name: "owners", type: "address[]" }
+    ],
+    outputs: []
   }
 ];
 
@@ -76,12 +86,41 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)"
 ];
 
-const iface = new ethers.Interface(INIT_POOL_ABI);
-const methodSelector = iface.getFunction("initializePool").selector.toLowerCase();
+const iface = new ethers.Interface(HOOK_ABI);
+const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+const SEL_INIT_POOL = iface.getFunction("initializePool").selector.toLowerCase();
+const SEL_ADD_OWNERS = iface.getFunction("addPoolOwners").selector.toLowerCase();
 const targetContract = ethers.getAddress(TARGET_CONTRACT);
 const filterFrom = FILTER_FROM?.trim() ? ethers.getAddress(FILTER_FROM.trim()) : "";
 
+// PancakeSwap Infinity poolId = keccak256(abi.encode(PoolKey))，用于把
+// initializePool 看到的币对缓存起来，addPoolOwners 命中同一 poolId 时补充显示。
+function computePoolId(currency0, currency1, hooks, poolManager, fee, parameters) {
+  try {
+    return ethers
+      .keccak256(
+        abiCoder.encode(
+          ["address", "address", "address", "address", "uint24", "bytes32"],
+          [currency0, currency1, hooks, poolManager, fee, parameters]
+        )
+      )
+      .toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+// 返回命中的方法名（initializePool / addPoolOwners）或 null
+function matchedMethod(data) {
+  const d = (data || "").toLowerCase();
+  if (d.startsWith(SEL_INIT_POOL)) return "initializePool";
+  if (d.startsWith(SEL_ADD_OWNERS)) return "addPoolOwners";
+  return null;
+}
+
 const tokenCache = new Map();
+// poolId(lowercase) -> { token0, token1, fee }
+const poolCache = new Map();
 
 function shortAddr(addr) {
   return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
@@ -218,7 +257,7 @@ function isTargetTx(tx) {
   const txFrom = tx.from ? tx.from.toLowerCase() : "";
   const data = (tx.input || tx.data || "").toLowerCase();
   if (txTo !== targetContract.toLowerCase()) return false;
-  if (!data.startsWith(methodSelector)) return false;
+  if (!matchedMethod(data)) return false;
   if (filterFrom && txFrom !== filterFrom.toLowerCase()) return false;
   return true;
 }
@@ -236,6 +275,9 @@ async function buildAlertMessage(tx, blockNumber, parsed) {
 
   const [t0, t1] = await Promise.all([getTokenMeta(currency0), getTokenMeta(currency1)]);
 
+  const poolId = computePoolId(currency0, currency1, hooks, poolManager, fee, parameters);
+  if (poolId) poolCache.set(poolId, { token0: t0, token1: t1, fee });
+
   let priceLine = "";
   try {
     const price = priceFromSqrtX96(sqrtPriceX96, t0.decimals, t1.decimals);
@@ -252,6 +294,7 @@ async function buildAlertMessage(tx, blockNumber, parsed) {
     `<b>From:</b> <code>${ethers.getAddress(tx.from)}</code>`,
     `<b>To:</b> <code>${ethers.getAddress(tx.to)}</code>`,
     ``,
+    poolId ? `<b>PoolId:</b> <code>${poolId}</code>` : null,
     `<b>Token0:</b> ${escapeHtml(t0.symbol)} <code>${currency0}</code>`,
     `<b>Token1:</b> ${escapeHtml(t1.symbol)} <code>${currency1}</code>`,
     `<b>Hooks:</b> <code>${hooks}</code>`,
@@ -262,7 +305,46 @@ async function buildAlertMessage(tx, blockNumber, parsed) {
     `<b>StartTimestamp:</b> <code>${startTimestamp.toString()}</code>`,
     `<b>开始时间:</b> ${escapeHtml(formatUnixTimestamp(startTimestamp))}`,
     `<b>sqrtPriceX96:</b> <code>${sqrtPriceX96.toString()}</code>${priceLine}`
-  ].join("\n");
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+}
+
+async function buildAddOwnersMessage(tx, blockNumber, parsed) {
+  const poolId = String(parsed.args.poolId ?? parsed.args[0]).toLowerCase();
+  const owners = (parsed.args.owners ?? parsed.args[1] ?? []).map((a) => ethers.getAddress(a));
+
+  const lines = [
+    `👤 <b>BSC Add Pool Owners 监听到加管理员</b>`,
+    ``,
+    `<b>区块:</b> <code>${blockNumber}</code>`,
+    `<b>Tx:</b> <a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`,
+    `<b>From:</b> <code>${ethers.getAddress(tx.from)}</code>`,
+    `<b>To:</b> <code>${ethers.getAddress(tx.to)}</code>`,
+    ``,
+    `<b>PoolId:</b> <code>${poolId}</code>`
+  ];
+
+  // 若该 poolId 在本次运行里见过 initializePool，补充币对信息
+  const cached = poolCache.get(poolId);
+  if (cached) {
+    lines.push(
+      `<b>Token0:</b> ${escapeHtml(cached.token0.symbol)} <code>${cached.token0.address}</code>`,
+      `<b>Token1:</b> ${escapeHtml(cached.token1.symbol)} <code>${cached.token1.address}</code>`,
+      `<b>Fee:</b> <code>${cached.fee.toString()}</code>，约 ${feeToPercent(cached.fee)}`
+    );
+  }
+
+  lines.push(``, `<b>新增 Owners (${owners.length}):</b>`);
+  for (const o of owners) lines.push(`• <code>${o}</code>`);
+
+  return lines.join("\n");
+}
+
+async function buildMessageForMethod(method, tx, blockNumber, parsed) {
+  return method === "addPoolOwners"
+    ? buildAddOwnersMessage(tx, blockNumber, parsed)
+    : buildAlertMessage(tx, blockNumber, parsed);
 }
 
 async function scanBlock(blockNumber) {
@@ -279,16 +361,17 @@ async function scanBlock(blockNumber) {
       console.log("命中但交易失败或 receipt 未就绪:", tx.hash);
       continue;
     }
+    const method = matchedMethod(tx.input || tx.data);
     try {
       const parsed = iface.parseTransaction({
         data: tx.input || tx.data,
         value: tx.value ?? 0
       });
-      const msg = await buildAlertMessage(tx, blockNumber, parsed);
+      const msg = await buildMessageForMethod(method, tx, blockNumber, parsed);
       await sendTelegram(msg);
-      console.log(`[ALERT] block=${blockNumber} tx=${tx.hash}`);
+      console.log(`[ALERT] method=${method} block=${blockNumber} tx=${tx.hash}`);
     } catch (err) {
-      console.error("解析 initializePool 失败:", tx.hash, err);
+      console.error(`解析 ${method} 失败:`, tx.hash, err);
     }
   }
 }
@@ -348,8 +431,8 @@ function buildHelpMessage() {
   return [
     `🤖 <b>BSC Initialize Pool 监听机器人</b>`,
     ``,
-    `监听合约 <code>${shortAddr(targetContract)}</code> 上的 <code>initializePool</code> 调用，`,
-    `命中后把新池信息推送到 Telegram。`,
+    `监听合约 <code>${shortAddr(targetContract)}</code> 上的 <code>initializePool</code> 与 <code>addPoolOwners</code> 调用，`,
+    `命中后把新池 / 加管理员信息推送到 Telegram。`,
     ``,
     `<b>命令</b>`,
     `/help - 显示本帮助`,
@@ -382,7 +465,7 @@ async function buildStatusMessage() {
     `<b>chainId:</b> <code>${chainId}</code>${chainId === "56" ? " (BSC)" : ""}`,
     `<b>监听合约:</b> <code>${targetContract}</code>`,
     `<b>From 过滤:</b> ${filterFrom ? `<code>${filterFrom}</code>` : "未限制（所有调用者）"}`,
-    `<b>方法选择器:</b> <code>${methodSelector}</code>`,
+    `<b>监听方法:</b> initializePool <code>${SEL_INIT_POOL}</code> / addPoolOwners <code>${SEL_ADD_OWNERS}</code>`,
     ``,
     `<b>最新区块:</b> <code>${latest}</code>`,
     `<b>已扫描到:</b> <code>${cursor ?? "未初始化"}</code>`,
@@ -461,14 +544,15 @@ async function buildPreviewForTx(txHash) {
   const txTo = tx.to ? tx.to.toLowerCase() : "";
   const data = (tx.data || "").toLowerCase();
   if (txTo !== targetContract.toLowerCase()) {
-    return `⚠️ 该交易的 To 不是目标合约，无法当作 initializePool 预览。`;
+    return `⚠️ 该交易的 To 不是目标合约，无法预览。`;
   }
-  if (!data.startsWith(methodSelector)) {
-    return `⚠️ 该交易不是 initializePool 调用（方法选择器不匹配）。`;
+  const method = matchedMethod(data);
+  if (!method) {
+    return `⚠️ 该交易不是 initializePool / addPoolOwners 调用（方法选择器不匹配）。`;
   }
   try {
     const parsed = iface.parseTransaction({ data: tx.data, value: tx.value ?? 0 });
-    const body = await buildAlertMessage(tx, tx.blockNumber ?? "pending", parsed);
+    const body = await buildMessageForMethod(method, tx, tx.blockNumber ?? "pending", parsed);
     return `🔎 <b>预览（真实交易）</b>\n\n${body}`;
   } catch (err) {
     return `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>`;
@@ -603,7 +687,7 @@ async function main() {
   console.log("chainId:", network.chainId.toString());
   console.log("targetContract:", targetContract);
   console.log("filterFrom:", filterFrom || "未限制 From，监听所有调用者");
-  console.log("methodSelector:", methodSelector);
+  console.log("selectors:", { initializePool: SEL_INIT_POOL, addPoolOwners: SEL_ADD_OWNERS });
   console.log("cursorFile:", CURSOR_FILE);
   console.log("pollMs:", POLL_MS);
   if (network.chainId !== 56n) {
