@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
+import { ethers } from "ethers";
 import {
   SEL_INIT_POOL,
   SEL_ADD_OWNERS,
   matchedMethod,
   computePoolId,
+  parseCLInitializeEvent,
+  CL_POOL_MANAGER_ABI,
   isValidPoolId,
   isTxHash,
   pancakePoolUrl,
@@ -76,6 +79,43 @@ describe("decode addPoolOwners", () => {
     const parsed = iface.parseTransaction({ data, value: 0 });
     expect(String(parsed.args.poolId).toLowerCase()).toBe(poolId);
     expect(parsed.args.owners[0].toLowerCase()).toBe(owners[0].toLowerCase());
+  });
+});
+
+describe("parseCLInitializeEvent", () => {
+  const mgrIface = new ethers.Interface(CL_POOL_MANAGER_ABI);
+  const poolManager = "0xa0ffb9c1ce1fe56963b0321b32e7a0302114058b";
+  const poolId = "0xae74941d0ff92e1e6c26a11fa0762ef29b87786e60daf62be00477288ec41abd";
+  const currency0 = "0x365DE036A1F7dcCb621530d517133521debB2013";
+  const currency1 = "0x55d398326f99059fF775485246999027B3197955";
+  const hooks = "0xb0bb171D333569CfD28a37F5c5DdDAAa90aD46af";
+  const encoded = mgrIface.encodeEventLog("Initialize", [
+    poolId,
+    currency0,
+    currency1,
+    hooks,
+    67,
+    "0x" + "00".repeat(32),
+    "97034285709124592626698884",
+    -134108
+  ]);
+  const log = { address: poolManager, topics: encoded.topics, data: encoded.data };
+
+  it("extracts the real poolId / fee from the event (not the Hook input)", () => {
+    const r = parseCLInitializeEvent([log], poolManager);
+    expect(r.poolId).toBe(poolId.toLowerCase());
+    expect(r.fee).toBe(67n);
+    expect(r.currency0.toLowerCase()).toBe(currency0.toLowerCase());
+    expect(r.currency1.toLowerCase()).toBe(currency1.toLowerCase());
+    expect(r.sqrtPriceX96).toBe(97034285709124592626698884n);
+  });
+  it("falls back to scanning all logs when poolManager address differs", () => {
+    const r = parseCLInitializeEvent([log], "0x0000000000000000000000000000000000000001");
+    expect(r.poolId).toBe(poolId.toLowerCase());
+  });
+  it("returns null when there is no Initialize log", () => {
+    expect(parseCLInitializeEvent([], poolManager)).toBe(null);
+    expect(parseCLInitializeEvent(null, poolManager)).toBe(null);
   });
 });
 

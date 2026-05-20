@@ -45,10 +45,51 @@ export const ERC20_ABI = [
   "function decimals() view returns (uint8)"
 ];
 
-// PancakeSwap Infinity CL Pool Manager：读取当前价格 / tick / fee
+// PancakeSwap Infinity CL Pool Manager：读取当前价格 / tick / fee，以及 Initialize 事件
 export const CL_POOL_MANAGER_ABI = [
-  "function getSlot0(bytes32 id) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)"
+  "function getSlot0(bytes32 id) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+  "event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, address hooks, uint24 fee, bytes32 parameters, uint160 sqrtPriceX96, int24 tick)"
 ];
+
+const clPoolManagerIface = new ethers.Interface(CL_POOL_MANAGER_ABI);
+
+// 从交易回执的日志里解析 CLPoolManager 的 Initialize 事件。
+// Hook 会改写 PoolKey 再调用 PoolManager，所以真实 poolId / fee / sqrtPriceX96
+// 必须以这个事件为准，而不是 Hook 函数入参自己算。
+// 先按 poolManager 地址匹配，找不到再放宽到任意地址。
+export function parseCLInitializeEvent(logs, expectedPoolManager) {
+  if (!Array.isArray(logs)) return null;
+  let expected = null;
+  try {
+    expected = ethers.getAddress(expectedPoolManager).toLowerCase();
+  } catch {}
+
+  const scan = (filterAddr) => {
+    for (const log of logs) {
+      if (filterAddr && log.address?.toLowerCase() !== filterAddr) continue;
+      let ev;
+      try {
+        ev = clPoolManagerIface.parseLog({ topics: Array.from(log.topics || []), data: log.data });
+      } catch {
+        continue;
+      }
+      if (ev?.name !== "Initialize") continue;
+      return {
+        poolId: String(ev.args.id).toLowerCase(),
+        currency0: ethers.getAddress(ev.args.currency0),
+        currency1: ethers.getAddress(ev.args.currency1),
+        hooks: ethers.getAddress(ev.args.hooks),
+        fee: ev.args.fee,
+        parameters: ev.args.parameters,
+        sqrtPriceX96: ev.args.sqrtPriceX96,
+        tick: ev.args.tick
+      };
+    }
+    return null;
+  };
+
+  return scan(expected) || (expected ? scan(null) : null);
+}
 
 export const iface = new ethers.Interface(HOOK_ABI);
 const abiCoder = ethers.AbiCoder.defaultAbiCoder();

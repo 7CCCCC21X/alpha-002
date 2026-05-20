@@ -18,6 +18,19 @@
 | `initializePool(PoolKey key, uint256 startTimestamp, uint160 sqrtPriceX96)` | `0x57c036db` | 🟢 新池：币对、双向价格、Fee、PoolId、PancakeSwap 链接、Token0/1、Hooks、PoolManager、开始时间 |
 | `addPoolOwners(bytes32 poolId, address[] owners)` | `0xfe7815ed` | 🟠 加管理员：PoolId、PancakeSwap 链接、新增 Owners、调用者（缓存命中时补充币对/Fee） |
 
+### poolId 以链上事件为准（重要）
+
+Hook 合约（CLAlphaHook）会**改写 PoolKey 再调用 PoolManager**，所以从 Hook 函数入参自己算出来的
+poolId / fee 跟链上真实值**不一致**。机器人解析交易回执里 **CLPoolManager 的 `Initialize` 事件**，
+以事件里的 `id`（真实 poolId）、`fee`、`sqrtPriceX96`、`currency0/1` 为准；只有在拿不到事件时才回退到入参计算。
+
+这样 `initializePool` 显示的 PoolId 就和后续 `addPoolOwners` 引用的 poolId 一致，两条消息能正确关联。
+
+### addPoolOwners 回复初始化消息
+
+同一个 poolId 的 `addPoolOwners` 告警会以 Telegram **回复**的形式挂在该池子的「新池初始化」消息下面，
+一眼就能看出是同一个池子的后续权限变更（前提是初始化消息在本次运行内推送过；message_id 记在内存里）。
+
 ### poolId 与币对关联
 
 看到 `initializePool` 时，机器人按 PancakeSwap Infinity 规则 `keccak256(abi.encode(PoolKey))` 计算 poolId，
@@ -96,6 +109,7 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `MAX_BLOCKS_PER_TICK` | | `40` | 单次最多扫多少块，防积压 |
 | `CONFIRMATIONS` | | `3` | 扫块确认数，避免链重组；只扫 `latest - N` 之前的块 |
 | `RPC_TIMEOUT_MS` | | `15000` | 单次 RPC 调用超时（毫秒） |
+| `SHOW_DEBUG_FIELDS` | | `false` | 是否显示 From / Hooks / PoolManager / Parameters / sqrtPriceX96 等底层字段 |
 | `TIMEZONE` | | `Asia/Taipei` | 时间显示用的时区 |
 | `CURSOR_FILE` | | `./lastBlock.txt` | 游标文件路径（见下方持久化说明） |
 | `POOLS_FILE` | | `./pools.json` | 池子缓存文件路径（见下方持久化说明） |
@@ -148,27 +162,34 @@ railway.json      Railway 部署配置
 
 ## 告警样式
 
+主消息默认精简，不再堆 From / Hooks / PoolManager / Parameters / sqrtPriceX96 等字段
+（需要时设 `SHOW_DEBUG_FIELDS=true` 显示）。
+
 `initializePool`：
 
 ```
-🟢 新池初始化 | NEX / BSC-USD
-价格: 1 NEX ≈ 0.0000015 BSC-USD
-      1 BSC-USD ≈ 666,666 NEX
-手续费: 67，约 0.0067%
-PoolId: 0xae749...41abd
-PancakeSwap: 🥞 Open Pool
+🟢 Alpha 新池初始化｜NEX / BSC-USD
+💰 初始价格
+1 NEX ≈ 0.0000015 BSC-USD
+1 BSC-USD ≈ 666,666 NEX
+🏷 手续费: 67，约 0.0067%
+⏰ 开始: 2026/05/20 22:00:00 (Asia/Taipei)
+🧩 PoolId
+0xae74941d0ff92e1e6c26a11fa0762ef29b87786e60daf62be00477288ec41abd
+📦 区块: 99031467 ｜ 🔎 Tx: 0x6b5b...d830
 [🥞 Pancake Pool] [🔎 BscScan Tx]
-[NEX] [BSC-USD]
+[🪙 NEX] [💵 BSC-USD]
 ```
 
-`addPoolOwners`：
+`addPoolOwners`（会回复到上面那条初始化消息）：
 
 ```
-🟠 添加池子管理员 | NEX / BSC-USD
-PoolId: 0xae749...41abd
-新增 Owners (1): 0xB62Abc...18756
-调用者: 0xb55eDC...CD9E
+🟠 Alpha 池子权限变更｜NEX / BSC-USD
+↳ 关联初始化池: 0xae74941d...ec41abd
+👤 新增池子管理员 (1):
+• 0xB62Abc6D40DDF8127a319c8B987a0017aAe18756
+📦 区块: 99033404 ｜ 🔎 Tx: 0x5db3...5456
 ⚠️ 这是权限/配置变更，不是转账。
 [🥞 Pancake Pool] [🔎 BscScan Tx]
-[Owner] [Hook 合约]
+[👤 Owner] [🧩 Hook 合约]
 ```
