@@ -113,6 +113,8 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `CONFIRMATIONS` | | `3` | 扫块确认数，避免链重组；只扫 `latest - N` 之前的块 |
 | `RPC_TIMEOUT_MS` | | `15000` | 单次 RPC 调用超时（毫秒） |
 | `SHOW_DEBUG_FIELDS` | | `false` | 是否显示 From / Hooks / PoolManager / Parameters / sqrtPriceX96 等底层字段 |
+| `COMMUNITY_NAME` | | `小C聊天群` | 消息结尾引流的群名（可点击的文字） |
+| `COMMUNITY_URL` | | `https://t.me/xiaoc236` | 群名指向的链接；留空则不显示页脚 |
 | `TIMEZONE` | | `Asia/Taipei` | 时间显示用的时区 |
 | `CURSOR_FILE` | | `./lastBlock.txt` | 游标文件路径（见下方持久化说明） |
 | `POOLS_FILE` | | `./pools.json` | 池子缓存文件路径（见下方持久化说明） |
@@ -181,6 +183,7 @@ PoolId（精简）、区块、Tx + 按钮。手续费 / From / Hooks / PoolManag
 🧩 PoolId：0xae74941d...8ec41abd
 📦 区块：99031467
 🔎 Tx：0x6b5b...d830
+👥 加入小C聊天群 获取最新币安Alpha消息
 [🥞 Alpha 池子] [🔎 BscScan Tx]
 [🪙 NEX] [💵 USDT]
 ```
@@ -201,6 +204,7 @@ NEX 的 Alpha 池子已经初始化，并完成池子管理员配置。
 0xB62Abc6D40DDF8127a319c8B987a0017aAe18756
 📦 区块：99033404
 🔎 Tx：0x5db3...5456
+👥 加入小C聊天群 获取最新币安Alpha消息
 [🥞 Alpha 池子] [🔎 BscScan Tx]
 [👤 Owner] [🧩 Hook 合约]
 ```

@@ -43,11 +43,20 @@ const {
   RPC_TIMEOUT_MS = "15000",
   // 是否显示 Hooks / PoolManager / Parameters / sqrtPriceX96 等底层调试字段
   SHOW_DEBUG_FIELDS = "false",
+  // 消息结尾的社群引流（留空 COMMUNITY_URL 则不显示）
+  COMMUNITY_NAME = "小C聊天群",
+  COMMUNITY_URL = "https://t.me/xiaoc236",
   // 控制命令白名单（TG 用户 ID，逗号分隔）。留空 = 没人能控制。
   WHITELIST_IDS = ""
 } = process.env;
 
 const showDebugFields = String(SHOW_DEBUG_FIELDS) === "true";
+
+// 消息结尾的社群引流页脚（告警 / 预览都会带上）
+function communityFooter() {
+  if (!COMMUNITY_URL) return "";
+  return `\n\n👥 加入<a href="${COMMUNITY_URL}">${escapeHtml(COMMUNITY_NAME)}</a> 获取最新币安Alpha消息`;
+}
 
 if (!RPC_URL) throw new Error("缺少 RPC_URL");
 if (!TG_BOT_TOKEN) throw new Error("缺少 TG_BOT_TOKEN");
@@ -344,7 +353,14 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt, { detailed = 
     ]
   });
 
-  return { text: lines.join("\n"), reply_markup, poolInfo, pair, poolId, poolUrl };
+  return {
+    text: lines.join("\n") + communityFooter(),
+    reply_markup,
+    poolInfo,
+    pair,
+    poolId,
+    poolUrl
+  };
 }
 
 async function buildAddOwnersMessage(tx, blockNumber, parsed, { detailed = false } = {}) {
@@ -397,7 +413,7 @@ async function buildAddOwnersMessage(tx, blockNumber, parsed, { detailed = false
     ].filter(Boolean)
   });
 
-  return { text: lines.join("\n"), reply_markup, pair, poolId };
+  return { text: lines.join("\n") + communityFooter(), reply_markup, pair, poolId };
 }
 
 async function buildMessageForMethod(method, tx, blockNumber, parsed, receipt, opts = {}) {
