@@ -586,6 +586,7 @@ function buildHelpMessage() {
     `/import &lt;txHash&gt; - 导入历史 initializePool 交易到本地缓存（白名单）`,
     `/last [n] - 查看最近 n 条告警（白名单）`,
     ``,
+    `💡 /import /pool /check 可不带参数发送，机器人会让你直接回复粘贴哈希 / poolId。`,
     `🔒 控制命令仅限白名单用户。其它人无法控制本机器人。`,
     `👥 群里用命令请用 <code>/命令@${escapeHtml(botUsername || "机器人用户名")}</code>，或在 BotFather 关闭 Privacy 模式。`
   ].join("\n");
@@ -683,6 +684,31 @@ async function reply(chatId, out) {
   await sendMessage(chatId, out.text, out.reply_markup ? { reply_markup: out.reply_markup } : {});
 }
 
+// 不带参数时发一条 ForceReply 提示，用户直接回复粘贴哈希/poolId 即可（类似快捷输入）
+const PROMPTS = {
+  "/import": [
+    "📝 导入池子",
+    "回复本条消息，发送 initializePool 的交易哈希（0x… 64 位）即可导入，不用再输入 /import。"
+  ],
+  "/pool": ["📝 查询池子", "回复本条消息，发送 poolId（0x… 64 位）即可查询，不用再输入 /pool。"],
+  "/check": ["📝 命中检查", "回复本条消息，发送交易哈希（0x… 64 位）即可检查，不用再输入 /check。"]
+};
+
+async function sendPrompt(chatId, command) {
+  const [title, body] = PROMPTS[command];
+  await sendMessage(chatId, `${title}\n${body}`, {
+    reply_markup: { force_reply: true, selective: true, input_field_placeholder: "粘贴 0x… 后发送" }
+  });
+}
+
+function pendingCommandFromReply(replyText) {
+  if (typeof replyText !== "string") return null;
+  for (const [command, [title]] of Object.entries(PROMPTS)) {
+    if (replyText.startsWith(title)) return command;
+  }
+  return null;
+}
+
 async function handleUpdate(update) {
   if (update.my_chat_member) {
     const m = update.my_chat_member;
@@ -698,18 +724,31 @@ async function handleUpdate(update) {
   }
 
   const msg = update.message;
-  const text = msg?.text;
-  if (!msg || typeof text !== "string" || !text.startsWith("/")) return;
+  const text = typeof msg?.text === "string" ? msg.text : null;
+  if (!msg || !text) return;
 
   const chatId = msg.chat.id;
   const userId = msg.from?.id;
 
-  let [cmdRaw, ...args] = text.trim().split(/\s+/);
-  let cmd = cmdRaw.toLowerCase();
-  if (cmd.includes("@")) {
-    const [name, mention] = cmd.split("@");
-    if (botUsername && mention !== botUsername.toLowerCase()) return;
-    cmd = name;
+  // 解析出命令和参数：支持 “/cmd 参数”，也支持 “回复机器人的提示后直接发参数”
+  let cmd = null;
+  let args = [];
+  if (text.startsWith("/")) {
+    let [cmdRaw, ...rest] = text.trim().split(/\s+/);
+    cmd = cmdRaw.toLowerCase();
+    if (cmd.includes("@")) {
+      const [name, mention] = cmd.split("@");
+      if (botUsername && mention !== botUsername.toLowerCase()) return;
+      cmd = name;
+    }
+    args = rest;
+  } else if (msg.reply_to_message && msg.reply_to_message.from?.id === botId) {
+    const pending = pendingCommandFromReply(msg.reply_to_message.text);
+    if (!pending) return;
+    cmd = pending;
+    args = text.trim().split(/\s+/);
+  } else {
+    return;
   }
 
   const requireWhitelist = async () => {
@@ -741,7 +780,10 @@ async function handleUpdate(update) {
       if (await requireWhitelist()) await sendMessage(chatId, await runConnectivityTest());
       break;
     case "/check":
-      if (await requireWhitelist()) await reply(chatId, await buildHitCheck(args[0]));
+      if (await requireWhitelist())
+        args[0]
+          ? await reply(chatId, await buildHitCheck(args[0]))
+          : await sendPrompt(chatId, "/check");
       break;
     case "/preview":
       if (await requireWhitelist())
@@ -751,10 +793,16 @@ async function handleUpdate(update) {
         );
       break;
     case "/pool":
-      if (await requireWhitelist()) await reply(chatId, await buildPoolInfoCard(args[0]));
+      if (await requireWhitelist())
+        args[0]
+          ? await reply(chatId, await buildPoolInfoCard(args[0]))
+          : await sendPrompt(chatId, "/pool");
       break;
     case "/import":
-      if (await requireWhitelist()) await reply(chatId, await buildImportResult(args[0]));
+      if (await requireWhitelist())
+        args[0]
+          ? await reply(chatId, await buildImportResult(args[0]))
+          : await sendPrompt(chatId, "/import");
       break;
     case "/last":
       if (await requireWhitelist()) await sendMessage(chatId, buildLastAlerts(args[0]));
