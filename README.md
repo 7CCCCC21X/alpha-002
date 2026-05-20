@@ -76,8 +76,21 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `/pool <poolId>` | 白名单 | 查询池子：币对、PancakeSwap 链接、初始价格、链上**当前价格**（读 `getSlot0`）、Init Tx |
 | `/import <txHash>` | 白名单 | 把历史 `initializePool` 交易解码并导入 `pools.json`，之后 `/pool` 和 `addPoolOwners` 都能用 |
 | `/last [n]` | 白名单 | 查看最近 n 条告警（默认 5，最多 20） |
+| `/subscribe` | 白名单 | 让当前会话/群开始接收告警（持久化到 `subscribers.json`） |
+| `/unsubscribe` | 白名单 | 取消当前会话/群的订阅 |
+| `/subscribers` | 白名单 | 列出所有收件会话（固定 + 订阅）和白名单 ID |
 
 只有白名单内的用户能用控制命令，其它人无法控制本机器人。
+
+### 订阅 / 收件会话
+
+告警会推给两类会话：环境变量 `TG_CHAT_ID` 里固定配置的，加上动态订阅的（去重）。
+
+- **拉机器人进群** → 机器人自动问候 → 白名单用户在群里发 `/subscribe`（或 `/subscribe@bot`），该群就开始收告警，无需改环境变量、无需重启。
+- `/unsubscribe` 退订；机器人被踢出群时会自动退订。
+- `/subscribers` 查看当前所有收件会话和白名单；`/status` 也会显示数量。
+- 想知道群的 chat_id：在群里发 `/id@bot`。
+- 订阅列表存到 `SUBSCRIBERS_FILE`（默认 `./subscribers.json`），Railway 上记得放到 Volume 才能重启不丢。
 
 ### 回复快捷输入（不用重复打命令）
 
@@ -102,7 +115,7 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 |---|---|---|---|
 | `RPC_URL` | ✅ | — | BSC RPC，建议用自己的稳定节点；公共 RPC 容易限速 |
 | `TG_BOT_TOKEN` | ✅ | — | BotFather 给的 token |
-| `TG_CHAT_ID` | ✅ | — | 告警推送目标，支持逗号分隔多个（私聊 / 群 / 频道） |
+| `TG_CHAT_ID` | | 空 | 固定收件会话，逗号分隔多个；可留空改用动态订阅（`/subscribe`） |
 | `WHITELIST_IDS` | | 空 | 控制命令白名单（TG 用户 ID，逗号分隔）。留空 = 没人能控制 |
 | `TARGET_CONTRACT` | | `0xb0bb171D…46af` | 监听的合约，也就是交易里的 To |
 | `FILTER_FROM` | | `0xb55eDCBE…CD9E` | 只推这个地址发起的调用；留空 = 监听所有调用者 |
@@ -116,6 +129,7 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `TIMEZONE` | | `Asia/Shanghai` | 开始时间显示时区（Asia/Shanghai=北京、Asia/Taipei=台北），会带 UTC 偏移 |
 | `CURSOR_FILE` | | `./lastBlock.txt` | 游标文件路径（见下方持久化说明） |
 | `POOLS_FILE` | | `./pools.json` | 池子缓存文件路径（见下方持久化说明） |
+| `SUBSCRIBERS_FILE` | | `./subscribers.json` | 动态订阅会话文件路径（见下方持久化说明） |
 
 ## 本地运行
 
@@ -140,7 +154,7 @@ npm run format # prettier
 3. Railway 会用 Nixpacks 自动构建并执行 `npm start`（见 `railway.json`）。这是常驻 worker，不需要配端口或域名。
 4. **持久化游标和池子缓存（推荐）**：Railway 文件系统是临时的，重启会丢失。如需持久化：
    - 在 service 的 **Data / Volumes** 挂载一个 Volume（例如挂到 `/data`）；
-   - 增加变量 `CURSOR_FILE=/data/lastBlock.txt` 和 `POOLS_FILE=/data/pools.json`。
+   - 增加变量 `CURSOR_FILE=/data/lastBlock.txt`、`POOLS_FILE=/data/pools.json`、`SUBSCRIBERS_FILE=/data/subscribers.json`。
 
 ## 工作原理
 

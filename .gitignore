@@ -3,5 +3,6 @@ node_modules/
 .env.local
 lastBlock.txt
 pools.json
+subscribers.json
 *.log
 npm-debug.log*

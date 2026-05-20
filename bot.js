@@ -28,7 +28,7 @@ import {
 const {
   RPC_URL,
   TG_BOT_TOKEN,
-  TG_CHAT_ID,
+  TG_CHAT_ID = "",
   TARGET_CONTRACT = "0xb0bb171D333569CfD28a37F5c5DdDAAa90aD46af",
   FILTER_FROM = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E",
   START_BLOCK,
@@ -37,9 +37,10 @@ const {
   // 扫块确认数，避免链重组：只扫已过 N 个确认的块
   CONFIRMATIONS = "3",
   TIMEZONE = "Asia/Shanghai",
-  // Railway 文件系统是临时的，重启会丢失。想持久化，挂 Volume 后把这两个指向挂载点。
+  // Railway 文件系统是临时的，重启会丢失。想持久化，挂 Volume 后把这几个指向挂载点。
   CURSOR_FILE = "./lastBlock.txt",
   POOLS_FILE = "./pools.json",
+  SUBSCRIBERS_FILE = "./subscribers.json",
   RPC_TIMEOUT_MS = "15000",
   // 消息结尾的社群引流（留空 COMMUNITY_URL 则不显示）
   COMMUNITY_NAME = "小C聊天群",
@@ -56,12 +57,15 @@ function communityFooter() {
 
 if (!RPC_URL) throw new Error("缺少 RPC_URL");
 if (!TG_BOT_TOKEN) throw new Error("缺少 TG_BOT_TOKEN");
-if (!TG_CHAT_ID) throw new Error("缺少 TG_CHAT_ID");
 
-const alertChatIds = String(TG_CHAT_ID)
+// 环境变量里固定配置的告警会话（始终接收）
+const envChatIds = String(TG_CHAT_ID)
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+
+// 动态订阅的会话：chatId(string) -> { id, name, type, addedAt }
+const subscribers = new Map();
 
 const whitelist = new Set(
   String(WHITELIST_IDS)
@@ -146,12 +150,18 @@ function poolMessageKey(chatId, poolId) {
   return `${String(chatId)}:${String(poolId).toLowerCase()}`;
 }
 
-// 告警推送：发给所有配置的会话，返回成功数。
+// 实际收件会话 = 环境变量配置的 + 动态订阅的（去重）
+function recipientChatIds() {
+  return [...new Set([...envChatIds, ...subscribers.keys()])];
+}
+
+// 告警推送：发给所有收件会话，返回成功数。
 // options: { poolId, rememberPoolMessage, replyToPoolMessage }
 async function sendTelegram(text, extra = {}, options = {}) {
   const { poolId, rememberPoolMessage = false, replyToPoolMessage = false } = options;
+  const recipients = recipientChatIds();
   let ok = 0;
-  for (const chatId of alertChatIds) {
+  for (const chatId of recipients) {
     const finalExtra = { ...extra };
     if (replyToPoolMessage && poolId) {
       const mid = poolMessageIds.get(poolMessageKey(chatId, poolId));
@@ -165,7 +175,7 @@ async function sendTelegram(text, extra = {}, options = {}) {
       }
     }
   }
-  lastPush = { ok, total: alertChatIds.length };
+  lastPush = { ok, total: recipients.length };
   return ok;
 }
 
@@ -236,6 +246,33 @@ async function savePoolInfo(poolInfo) {
   } catch (err) {
     console.error("写入 pools.json 失败:", err?.message || err);
   }
+}
+
+async function loadSubscribers() {
+  try {
+    const list = JSON.parse(await fs.readFile(SUBSCRIBERS_FILE, "utf8"));
+    if (Array.isArray(list)) {
+      for (const s of list) {
+        if (s?.id != null) subscribers.set(String(s.id), s);
+      }
+    }
+    console.log(`已从 ${SUBSCRIBERS_FILE} 载入 ${subscribers.size} 个订阅会话`);
+  } catch {}
+}
+
+async function saveSubscribers() {
+  try {
+    await fs.writeFile(SUBSCRIBERS_FILE, JSON.stringify([...subscribers.values()], null, 2));
+  } catch (err) {
+    console.error("写入 subscribers.json 失败:", err?.message || err);
+  }
+}
+
+function chatDisplayName(chat) {
+  if (!chat) return "";
+  if (chat.title) return chat.title;
+  if (chat.username) return "@" + chat.username;
+  return [chat.first_name, chat.last_name].filter(Boolean).join(" ") || String(chat.id);
 }
 
 // ---------------- 命中判断 ----------------
@@ -649,6 +686,9 @@ function buildHelpMessage() {
     `/pool &lt;poolId&gt; - 查询池子信息 / 当前价格 / PancakeSwap 链接（白名单）`,
     `/import &lt;txHash&gt; - 导入历史 initializePool 交易到本地缓存（白名单）`,
     `/last [n] - 查看最近 n 条告警（白名单）`,
+    `/subscribe - 让当前会话/群接收告警（白名单）`,
+    `/unsubscribe - 取消当前会话/群的订阅（白名单）`,
+    `/subscribers - 查看所有收件会话和白名单（白名单）`,
     ``,
     `💡 /import /pool /check 可不带参数发送，机器人会让你直接回复粘贴哈希 / poolId。`,
     `🔒 控制命令仅限白名单用户。其它人无法控制本机器人。`,
@@ -696,8 +736,10 @@ async function buildStatusMessage() {
     `<b>缓存:</b> Pools <code>${poolCache.size}</code> / Tokens <code>${tokenCache.size}</code>`,
     `<b>最近告警:</b> ${escapeHtml(la)}`,
     `<b>推送:</b> <code>${lastPush.ok}/${lastPush.total}</code> chats OK`,
-    `<b>告警会话:</b> <code>${escapeHtml(alertChatIds.join(", "))}</code>`,
-    `<b>白名单人数:</b> <code>${whitelist.size}</code>`
+    `<b>收件会话:</b> 固定 <code>${envChatIds.length}</code> + 订阅 <code>${subscribers.size}</code>（共 <code>${recipientChatIds().length}</code>）`,
+    `<b>白名单:</b> ${whitelist.size ? [...whitelist].map((id) => `<code>${escapeHtml(id)}</code>`).join("、") : "（空）"}`,
+    ``,
+    `查看收件 / 订阅明细：/subscribers`
   ].join("\n");
 }
 
@@ -714,8 +756,9 @@ async function runConnectivityTest() {
   } catch (err) {
     lines.push(`❌ RPC 失败：<code>${escapeHtml(err?.message || err)}</code>`);
   }
+  const recipients = recipientChatIds();
   let okCount = 0;
-  for (const chatId of alertChatIds) {
+  for (const chatId of recipients) {
     if (
       await sendMessage(
         chatId,
@@ -724,8 +767,52 @@ async function runConnectivityTest() {
     )
       okCount++;
   }
-  lines.push(`📨 告警推送：${okCount}/${alertChatIds.length} 个会话发送成功。`);
+  lines.push(`📨 告警推送：${okCount}/${recipients.length} 个会话发送成功。`);
   return lines.join("\n");
+}
+
+function buildSubscribersList() {
+  const lines = [`📡 <b>收件会话</b>`, ``];
+  if (envChatIds.length) {
+    lines.push(`<b>环境变量固定（TG_CHAT_ID）：</b>`);
+    for (const id of envChatIds) lines.push(`• <code>${escapeHtml(id)}</code>`);
+    lines.push(``);
+  }
+  lines.push(`<b>动态订阅（/subscribe）：</b>`);
+  if (subscribers.size === 0) {
+    lines.push(`（暂无，在群里发 /subscribe 即可订阅）`);
+  } else {
+    for (const s of subscribers.values()) {
+      lines.push(
+        `• <code>${escapeHtml(String(s.id))}</code> ${escapeHtml(s.name || "")} (${escapeHtml(s.type || "")})`
+      );
+    }
+  }
+  lines.push(``, `<b>白名单用户：</b>`);
+  lines.push(
+    whitelist.size
+      ? [...whitelist].map((id) => `<code>${escapeHtml(id)}</code>`).join("、")
+      : "（空）"
+  );
+  return lines.join("\n");
+}
+
+async function subscribeChat(chat) {
+  const id = String(chat.id);
+  subscribers.set(id, {
+    id: chat.id,
+    name: chatDisplayName(chat),
+    type: chat.type,
+    addedAt: Date.now()
+  });
+  await saveSubscribers();
+}
+
+async function unsubscribeChat(chatId) {
+  if (!subscribers.has(String(chatId))) return false;
+  subscribers.delete(String(chatId));
+  await saveSubscribers();
+  return true;
 }
 
 function buildLastAlerts(n) {
@@ -778,11 +865,16 @@ async function handleUpdate(update) {
     const m = update.my_chat_member;
     const status = m.new_chat_member?.status;
     const who = m.new_chat_member?.user;
-    if (who && botId && who.id === botId && (status === "member" || status === "administrator")) {
-      await sendMessage(
-        m.chat.id,
-        `👋 我是 BSC InitializePool 监听机器人。发送 /help 查看命令；控制命令仅限白名单用户。`
-      );
+    if (who && botId && who.id === botId) {
+      if (status === "member" || status === "administrator") {
+        await sendMessage(
+          m.chat.id,
+          `👋 我是币安 Alpha 上线前信号机器人。\n白名单用户在本群发送 <b>/subscribe</b> 即可让本群接收告警；/help 查看全部命令。`
+        );
+      } else if (status === "left" || status === "kicked") {
+        // 被移出群：自动取消该群订阅
+        if (await unsubscribeChat(m.chat.id)) console.log("已移除订阅(被踢):", m.chat.id);
+      }
     }
     return;
   }
@@ -871,6 +963,24 @@ async function handleUpdate(update) {
     case "/last":
       if (await requireWhitelist()) await sendMessage(chatId, buildLastAlerts(args[0]));
       break;
+    case "/subscribe":
+      if (await requireWhitelist()) {
+        await subscribeChat(msg.chat);
+        await sendMessage(
+          chatId,
+          `✅ 已订阅：本会话（<code>${chatId}</code>）将接收 Alpha 上线前信号。\n取消请发 /unsubscribe。`
+        );
+      }
+      break;
+    case "/unsubscribe":
+      if (await requireWhitelist()) {
+        const ok = await unsubscribeChat(chatId);
+        await sendMessage(chatId, ok ? `✅ 已退订本会话。` : `本会话本来就没有订阅。`);
+      }
+      break;
+    case "/subscribers":
+      if (await requireWhitelist()) await sendMessage(chatId, buildSubscribersList());
+      break;
     default:
       break;
   }
@@ -923,7 +1033,10 @@ async function setupTelegram() {
       { command: "preview", description: "预览告警消息（可加 txHash）" },
       { command: "pool", description: "查询池子信息 / PancakeSwap 链接" },
       { command: "import", description: "导入历史 initializePool 交易" },
-      { command: "last", description: "查看最近的告警" }
+      { command: "last", description: "查看最近的告警" },
+      { command: "subscribe", description: "让当前会话/群接收告警" },
+      { command: "unsubscribe", description: "取消当前会话/群的订阅" },
+      { command: "subscribers", description: "查看收件会话和白名单" }
     ]
   });
   console.log("whitelist:", whitelist.size ? [...whitelist].join(", ") : "（空，暂无人可控制）");
@@ -1015,6 +1128,7 @@ async function tick() {
 
 async function main() {
   await loadPools();
+  await loadSubscribers();
   const network = await provider.getNetwork();
   console.log("BSC Initialize Pool / Add Pool Owners TG Bot started");
   console.log("chainId:", network.chainId.toString());
@@ -1023,6 +1137,18 @@ async function main() {
   console.log("selectors:", { initializePool: SEL_INIT_POOL, addPoolOwners: SEL_ADD_OWNERS });
   console.log("cursorFile:", CURSOR_FILE, "| poolsFile:", POOLS_FILE);
   console.log("pollMs:", POLL_MS, "| confirmations:", confirmations);
+  console.log(
+    "recipients:",
+    recipientChatIds().length,
+    "(env",
+    envChatIds.length,
+    "+ subs",
+    subscribers.size,
+    ")"
+  );
+  if (recipientChatIds().length === 0) {
+    console.warn("提示：当前没有任何收件会话。设置 TG_CHAT_ID 或在群里发 /subscribe。");
+  }
   if (network.chainId !== 56n) console.warn("警告：当前 RPC chainId 不是 56，可能不是 BSC 主网。");
 
   try {
