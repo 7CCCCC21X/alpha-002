@@ -299,7 +299,7 @@ const TZ_LABELS = {
   UTC: "UTC"
 };
 
-// 紧凑展示时间（无秒），带友好时区标签，例如 "2026/05/20 22:00 北京"
+// 紧凑展示时间（无秒），带友好时区标签和 UTC 偏移，例如 "2026/05/20 22:00 北京 (UTC+8)"
 export function formatUiTime(ts, timezone = "Asia/Shanghai") {
   const n = Number(ts);
   if (!Number.isFinite(n) || n <= 0) return String(ts);
@@ -311,10 +311,13 @@ export function formatUiTime(ts, timezone = "Asia/Shanghai") {
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
-      hourCycle: "h23"
+      hourCycle: "h23",
+      timeZoneName: "shortOffset"
     }).formatToParts(new Date(n * 1000));
     const g = (t) => parts.find((p) => p.type === t)?.value || "";
-    return `${g("year")}/${g("month")}/${g("day")} ${g("hour")}:${g("minute")} ${TZ_LABELS[timezone] || timezone}`;
+    const label = TZ_LABELS[timezone] || timezone;
+    const offset = (g("timeZoneName") || "").replace("GMT", "UTC");
+    return `${g("year")}/${g("month")}/${g("day")} ${g("hour")}:${g("minute")} ${label}${offset ? ` (${offset})` : ""}`;
   } catch {
     return new Date(n * 1000).toISOString();
   }

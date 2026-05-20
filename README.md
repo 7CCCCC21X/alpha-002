@@ -54,13 +54,12 @@ poolId → 币对的映射会写入 `pools.json` 持久化，因此：
 https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 ```
 
-所有涉及 poolId 的告警 / 命令（`initializePool`、`addPoolOwners`、`/preview`、`/pool`、`/import`、`/last`）都会附：
+底部内联按钮第一行都是 **🥞 Alpha 池子**（链到 PancakeSwap 池子）/ **🔎 BscScan Tx**：
 
-- 正文里一行 `PancakeSwap: 🥞 Open Pool` 链接；
-- 底部内联按钮：第一行 **🥞 Pancake Pool** / **🔎 BscScan Tx**，第二行 token / owner 相关按钮：
-  - `initializePool`、`/pool`：`[Token0] [Token1]`（链到 BscScan 代币页）
-  - `addPoolOwners`：`[Owner] [Hook 合约]`
-  - 示例预览的零哈希交易不显示 BscScan Tx 按钮。
+- `initializePool`：正文直接显示两个代币的合约地址（可一键复制），不再放代币按钮；
+- `addPoolOwners`：第二行 `[👤 Owner] [🧩 Hook 合约]`；
+- `/pool`：第二行 `[Token0] [Token1]`（链到 BscScan 代币页）；
+- 示例预览的零哈希交易不显示 BscScan Tx 按钮。
 
 ## Telegram 命令
 
@@ -114,7 +113,7 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `RPC_TIMEOUT_MS` | | `15000` | 单次 RPC 调用超时（毫秒） |
 | `COMMUNITY_NAME` | | `小C聊天群` | 消息结尾引流的群名（可点击的文字） |
 | `COMMUNITY_URL` | | `https://t.me/xiaoc236` | 群名指向的链接；留空则不显示页脚 |
-| `TIMEZONE` | | `Asia/Taipei` | 时间显示用的时区 |
+| `TIMEZONE` | | `Asia/Shanghai` | 开始时间显示时区（Asia/Shanghai=北京、Asia/Taipei=台北），会带 UTC 偏移 |
 | `CURSOR_FILE` | | `./lastBlock.txt` | 游标文件路径（见下方持久化说明） |
 | `POOLS_FILE` | | `./pools.json` | 池子缓存文件路径（见下方持久化说明） |
 
@@ -180,7 +179,7 @@ railway.json      Railway 部署配置
 1 USDT ≈ 666,666.67 NEX
 🪙 NEX 合约：0x365DE036A1F7dcCb621530d517133521debB2013
 💵 USDT 合约：0x55d398326f99059fF775485246999027B3197955
-⏰ 开始时间：2026/05/20 22:00 北京
+⏰ 开始时间：2026/05/20 22:00 北京 (UTC+8)
 🧩 PoolId：0xae74941d...8ec41abd
 📦 区块：99031467
 🔎 Tx：0x6b5b...d830

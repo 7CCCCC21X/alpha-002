@@ -218,9 +218,9 @@ describe("shortPoolId", () => {
 });
 
 describe("formatUiTime", () => {
-  it("formats Beijing time without seconds and labels it", () => {
+  it("formats Beijing time without seconds and labels it with UTC offset", () => {
     // 1779285600 = 2026-05-20 22:00 (UTC+8)
-    expect(formatUiTime(1779285600, "Asia/Shanghai")).toBe("2026/05/20 22:00 北京");
+    expect(formatUiTime(1779285600, "Asia/Shanghai")).toBe("2026/05/20 22:00 北京 (UTC+8)");
   });
 });
 
