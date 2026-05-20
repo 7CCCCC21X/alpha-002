@@ -16,8 +16,9 @@ import {
   bscscanAddressUrl,
   bscscanTokenUrl,
   shortAddr,
+  shortPoolId,
   escapeHtml,
-  formatUnixTimestamp,
+  formatUiTime,
   feeToPercent,
   formatUptime,
   formatPrices,
@@ -35,7 +36,7 @@ const {
   MAX_BLOCKS_PER_TICK = "40",
   // 扫块确认数，避免链重组：只扫已过 N 个确认的块
   CONFIRMATIONS = "3",
-  TIMEZONE = "Asia/Taipei",
+  TIMEZONE = "Asia/Shanghai",
   // Railway 文件系统是临时的，重启会丢失。想持久化，挂 Volume 后把这两个指向挂载点。
   CURSOR_FILE = "./lastBlock.txt",
   POOLS_FILE = "./pools.json",
@@ -246,7 +247,7 @@ function isTargetTx(tx) {
 
 // ---------------- 消息构造 ----------------
 
-async function buildAlertMessage(tx, blockNumber, parsed, receipt) {
+async function buildAlertMessage(tx, blockNumber, parsed, receipt, { detailed = false } = {}) {
   const key = parsed.args.key ?? parsed.args[0];
   const inputCurrency0 = ethers.getAddress(key.currency0 ?? key[0]);
   const inputCurrency1 = ethers.getAddress(key.currency1 ?? key[1]);
@@ -297,27 +298,32 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt) {
     : null;
   if (poolInfo) poolCache.set(poolId, poolInfo);
 
-  const lines = [`🟢 <b>Alpha 新池初始化</b>｜${escapeHtml(pair)}`, ``];
+  const lines = [
+    `🚨 <b>Binance Alpha代币 上线前信号｜${escapeHtml(pair)}</b>`,
+    ``,
+    `🟢 <b>状态：</b>Alpha 流动性池已初始化`,
+    ``
+  ];
   if (prices) {
     lines.push(
       `💰 <b>初始价格</b>`,
       `1 ${escapeHtml(t0.symbol)} ≈ <code>${prices.forward}</code> ${escapeHtml(t1.symbol)}`,
-      `1 ${escapeHtml(t1.symbol)} ≈ <code>${prices.inverse}</code> ${escapeHtml(t0.symbol)}`
+      `1 ${escapeHtml(t1.symbol)} ≈ <code>${prices.inverse}</code> ${escapeHtml(t0.symbol)}`,
+      ``
     );
   }
   lines.push(
-    `🏷 <b>手续费:</b> <code>${fee.toString()}</code>，约 ${feeToPercent(fee)}`,
-    `⏰ <b>开始:</b> ${escapeHtml(formatUnixTimestamp(startTimestamp, TIMEZONE))}`,
-    ``,
-    `🧩 <b>PoolId</b>`,
-    `<code>${poolId}</code>`,
-    ``,
-    `📦 <b>区块:</b> <code>${blockNumber}</code> ｜ 🔎 <b>Tx:</b> <a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`
+    `⏰ <b>开始时间：</b>${escapeHtml(formatUiTime(startTimestamp, TIMEZONE))}`,
+    `🧩 <b>PoolId：</b><code>${shortPoolId(poolId)}</code>`,
+    `📦 <b>区块：</b><code>${blockNumber}</code>`,
+    `🔎 <b>Tx：</b><a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`
   );
-  if (showDebugFields) {
+  if (detailed) {
     lines.push(
       ``,
-      `🛠 <b>Debug</b>`,
+      `🛠 <b>详细</b>`,
+      `手续费: <code>${fee.toString()}</code>，约 ${feeToPercent(fee)}`,
+      `完整 PoolId: <code>${poolId}</code>`,
       `From: <code>${ethers.getAddress(tx.from)}</code>`,
       `Token0: <code>${currency0}</code>`,
       `Token1: <code>${currency1}</code>`,
@@ -325,7 +331,7 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt) {
       `PoolManager: <code>${poolManager}</code>`,
       `Parameters: <code>${parameters}</code>`,
       `sqrtPriceX96: <code>${sqrtPriceX96.toString()}</code>`,
-      `poolId 来源: ${realInit ? "Initialize 事件" : "Hook 入参计算（回退）"}`
+      `poolId 来源: ${realInit ? "Initialize 事件" : hookStarted ? "Hook 事件" : "入参计算（回退）"}`
     );
   }
 
@@ -341,30 +347,45 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt) {
   return { text: lines.join("\n"), reply_markup, poolInfo, pair, poolId, poolUrl };
 }
 
-async function buildAddOwnersMessage(tx, blockNumber, parsed) {
+async function buildAddOwnersMessage(tx, blockNumber, parsed, { detailed = false } = {}) {
   const poolId = String(parsed.args.poolId ?? parsed.args[0]).toLowerCase();
   const owners = (parsed.args.owners ?? parsed.args[1] ?? []).map((a) => ethers.getAddress(a));
   const cached = poolCache.get(poolId);
   const pair = cached ? `${cached.token0.symbol} / ${cached.token1.symbol}` : null;
+  const tokenSymbol = cached ? escapeHtml(cached.token0.symbol) : "该代币";
 
   const lines = [
-    `🟠 <b>Alpha 池子权限变更</b>｜${pair ? escapeHtml(pair) : "未知池子"}`,
-    `↳ <b>关联初始化池:</b> <code>${poolId}</code>`
+    `🧩 <b>Binance Alpha 上线前信号更新｜${pair ? escapeHtml(pair) : "未知池子"}</b>`,
+    ``,
+    `🟢 <b>状态：</b>管理员配置完成`,
+    `↳ <b>关联池子：</b><code>${shortPoolId(poolId)}</code>`,
+    ``,
+    `<b>进度：</b>`,
+    `✅ 1/2 池子初始化完成`,
+    `✅ 2/2 管理员配置完成`,
+    ``,
+    `📌 <b>结论：</b>`,
+    `${tokenSymbol} 的 Alpha 池子已经初始化，并完成池子管理员配置。`,
+    `这通常属于 Binance Alpha / Alpha Earn 池子开放前的链上准备动作。`,
+    ``,
+    `👤 <b>新增管理员：</b>`,
+    ...owners.map((o) => `<code>${o}</code>`),
+    ``,
+    `📦 <b>区块：</b><code>${blockNumber}</code>`,
+    `🔎 <b>Tx：</b><a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`
   ];
   if (!cached) {
     lines.push(
-      `（本地没有该 poolId 的初始化记录，用 /import &lt;initializePool 交易哈希&gt; 可补全币对）`
+      `<i>（本地无该池初始化记录，可用 /import &lt;initializePool 交易哈希&gt; 补全币对）</i>`
     );
   }
-  lines.push(``, `👤 <b>新增池子管理员 (${owners.length}):</b>`);
-  for (const o of owners) lines.push(`• <code>${o}</code>`);
-  lines.push(
-    ``,
-    `📦 <b>区块:</b> <code>${blockNumber}</code> ｜ 🔎 <b>Tx:</b> <a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`,
-    `<i>⚠️ 这是权限/配置变更，不是转账。</i>`
-  );
-  if (showDebugFields) {
-    lines.push(``, `🛠 <b>Debug</b>`, `调用者: <code>${ethers.getAddress(tx.from)}</code>`);
+  if (detailed) {
+    lines.push(
+      ``,
+      `🛠 <b>详细</b>`,
+      `调用者: <code>${ethers.getAddress(tx.from)}</code>`,
+      `完整 PoolId: <code>${poolId}</code>`
+    );
   }
 
   const reply_markup = buildPoolKeyboard({
@@ -379,10 +400,10 @@ async function buildAddOwnersMessage(tx, blockNumber, parsed) {
   return { text: lines.join("\n"), reply_markup, pair, poolId };
 }
 
-async function buildMessageForMethod(method, tx, blockNumber, parsed, receipt) {
+async function buildMessageForMethod(method, tx, blockNumber, parsed, receipt, opts = {}) {
   return method === "addPoolOwners"
-    ? buildAddOwnersMessage(tx, blockNumber, parsed)
-    : buildAlertMessage(tx, blockNumber, parsed, receipt);
+    ? buildAddOwnersMessage(tx, blockNumber, parsed, opts)
+    : buildAlertMessage(tx, blockNumber, parsed, receipt, opts);
 }
 
 // /pool 信息卡片
@@ -508,7 +529,7 @@ async function buildPreviewSample() {
     to: targetContract,
     data
   };
-  const m = await buildAlertMessage(sampleTx, "（示例）", parsed);
+  const m = await buildAlertMessage(sampleTx, "（示例）", parsed, null, { detailed: true });
   return { text: `🔎 <b>预览示例（非真实告警）</b>\n\n${m.text}`, reply_markup: m.reply_markup };
 }
 
@@ -540,7 +561,16 @@ async function buildPreviewForTx(txHash) {
             "getTransactionReceipt"
           ).catch(() => null)
         : null;
-    const m = await buildMessageForMethod(method, tx, tx.blockNumber ?? "pending", parsed, receipt);
+    const m = await buildMessageForMethod(
+      method,
+      tx,
+      tx.blockNumber ?? "pending",
+      parsed,
+      receipt,
+      {
+        detailed: true
+      }
+    );
     return { text: `🔎 <b>预览（真实交易）</b>\n\n${m.text}`, reply_markup: m.reply_markup };
   } catch (err) {
     return { text: `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>` };
@@ -604,7 +634,10 @@ async function buildHitCheck(txHash) {
         tx,
         tx.blockNumber ?? "pending",
         parsed,
-        receipt
+        receipt,
+        {
+          detailed: true
+        }
       );
       return {
         text: `${lines.join("\n")}\n\n— — — 推送内容 — — —\n${m.text}`,
@@ -948,7 +981,9 @@ async function scanBlock(blockNumber) {
     let built;
     try {
       const parsed = iface.parseTransaction({ data: tx.input || tx.data, value: tx.value ?? 0 });
-      built = await buildMessageForMethod(method, tx, blockNumber, parsed, receipt);
+      built = await buildMessageForMethod(method, tx, blockNumber, parsed, receipt, {
+        detailed: showDebugFields
+      });
     } catch (err) {
       console.error(`解析 ${method} 失败:`, tx.hash, err);
       continue;

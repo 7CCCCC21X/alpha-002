@@ -165,34 +165,42 @@ railway.json      Railway 部署配置
 
 ## 告警样式
 
-主消息默认精简，不再堆 From / Hooks / PoolManager / Parameters / sqrtPriceX96 等字段
-（需要时设 `SHOW_DEBUG_FIELDS=true` 显示）。
+正式推送主打「Binance Alpha 上线前信号」，只展示用户第一眼需要的：币对、状态、价格、开始时间、
+PoolId（精简）、区块、Tx + 按钮。手续费 / From / Hooks / PoolManager / Parameters / sqrtPriceX96
+等技术字段**只在 `/check`、`/preview`（detailed）里显示**，或在生产里设 `SHOW_DEBUG_FIELDS=true` 才追加。
 
 `initializePool`：
 
 ```
-🟢 Alpha 新池初始化｜NEX / BSC-USD
+🚨 Binance Alpha代币 上线前信号｜NEX / USDT
+🟢 状态：Alpha 流动性池已初始化
 💰 初始价格
-1 NEX ≈ 0.0000015 BSC-USD
-1 BSC-USD ≈ 666,666 NEX
-🏷 手续费: 67，约 0.0067%
-⏰ 开始: 2026/05/20 22:00:00 (Asia/Taipei)
-🧩 PoolId
-0xae74941d0ff92e1e6c26a11fa0762ef29b87786e60daf62be00477288ec41abd
-📦 区块: 99031467 ｜ 🔎 Tx: 0x6b5b...d830
-[🥞 Pancake Pool] [🔎 BscScan Tx]
-[🪙 NEX] [💵 BSC-USD]
+1 NEX ≈ 0.0000015 USDT
+1 USDT ≈ 666,666.67 NEX
+⏰ 开始时间：2026/05/20 22:00 北京
+🧩 PoolId：0xae74941d...8ec41abd
+📦 区块：99031467
+🔎 Tx：0x6b5b...d830
+[🥞 Alpha 池子] [🔎 BscScan Tx]
+[🪙 NEX] [💵 USDT]
 ```
 
 `addPoolOwners`（会回复到上面那条初始化消息）：
 
 ```
-🟠 Alpha 池子权限变更｜NEX / BSC-USD
-↳ 关联初始化池: 0xae74941d...ec41abd
-👤 新增池子管理员 (1):
-• 0xB62Abc6D40DDF8127a319c8B987a0017aAe18756
-📦 区块: 99033404 ｜ 🔎 Tx: 0x5db3...5456
-⚠️ 这是权限/配置变更，不是转账。
-[🥞 Pancake Pool] [🔎 BscScan Tx]
+🧩 Binance Alpha 上线前信号更新｜NEX / USDT
+🟢 状态：管理员配置完成
+↳ 关联池子：0xae74941d...8ec41abd
+进度：
+✅ 1/2 池子初始化完成
+✅ 2/2 管理员配置完成
+📌 结论：
+NEX 的 Alpha 池子已经初始化，并完成池子管理员配置。
+这通常属于 Binance Alpha / Alpha Earn 池子开放前的链上准备动作。
+👤 新增管理员：
+0xB62Abc6D40DDF8127a319c8B987a0017aAe18756
+📦 区块：99033404
+🔎 Tx：0x5db3...5456
+[🥞 Alpha 池子] [🔎 BscScan Tx]
 [👤 Owner] [🧩 Hook 合约]
 ```

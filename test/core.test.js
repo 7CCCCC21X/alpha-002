@@ -18,6 +18,9 @@ import {
   priceFromSqrtX96,
   inversePriceFromSqrtX96,
   formatPrices,
+  formatUiNumber,
+  shortPoolId,
+  formatUiTime,
   humanizeNumberString,
   buildPoolKeyboard,
   iface
@@ -190,6 +193,34 @@ describe("price math (real NEX/BSC-USD pool)", () => {
     const p = formatPrices(sqrt, 18, 18);
     expect(Number(p.forward)).toBeCloseTo(0.0000015, 8);
     expect(p.inverse).toContain(",");
+  });
+});
+
+describe("formatUiNumber", () => {
+  it("uses 2 significant figures for tiny values", () => {
+    expect(formatUiNumber(0.0000015, 8)).toBe("0.0000015");
+  });
+  it("uses thousands separators for large values", () => {
+    expect(formatUiNumber(666666.666, 2)).toBe("666,666.67");
+    expect(formatUiNumber(1000, 2)).toBe("1,000");
+  });
+  it("handles zero and non-finite", () => {
+    expect(formatUiNumber(0)).toBe("0");
+    expect(formatUiNumber("x")).toBe("x");
+  });
+});
+
+describe("shortPoolId", () => {
+  it("keeps head and tail of a poolId", () => {
+    const pid = "0xae74941d0ff92e1e6c26a11fa0762ef29b87786e60daf62be00477288ec41abd";
+    expect(shortPoolId(pid)).toBe("0xae74941d...8ec41abd");
+  });
+});
+
+describe("formatUiTime", () => {
+  it("formats Beijing time without seconds and labels it", () => {
+    // 1779285600 = 2026-05-20 22:00 (UTC+8)
+    expect(formatUiTime(1779285600, "Asia/Shanghai")).toBe("2026/05/20 22:00 北京");
   });
 });
 

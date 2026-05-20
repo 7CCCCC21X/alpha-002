@@ -263,15 +263,60 @@ export function inversePriceFromSqrtX96(sqrtPriceX96, decimals0, decimals1, prec
   return formatScaledInteger(numerator / denominator, precision);
 }
 
-// 返回 { forward, inverse } 两个方向的人类可读价格
+// 返回 { forward, inverse } 两个方向的展示价格（千分位 + 小数位精简）
 export function formatPrices(sqrtPriceX96, decimals0, decimals1) {
   try {
-    return {
-      forward: humanizeNumberString(priceFromSqrtX96(sqrtPriceX96, decimals0, decimals1), 12),
-      inverse: humanizeNumberString(inversePriceFromSqrtX96(sqrtPriceX96, decimals0, decimals1), 6)
-    };
+    const fwd = Number(priceFromSqrtX96(sqrtPriceX96, decimals0, decimals1));
+    const inv = Number(inversePriceFromSqrtX96(sqrtPriceX96, decimals0, decimals1));
+    return { forward: formatUiNumber(fwd, 8), inverse: formatUiNumber(inv, 2) };
   } catch {
     return null;
+  }
+}
+
+// 价格 / 数字的人类可读展示：小于 0.0001 用两位有效数字，否则千分位
+export function formatUiNumber(value, maxFractionDigits = 2) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  if (n === 0) return "0";
+  if (Math.abs(n) < 0.0001) return n.toPrecision(2).replace(/\.?0+$/, "");
+  return n.toLocaleString("en-US", { maximumFractionDigits: maxFractionDigits });
+}
+
+export function shortHash(value, head = 6, tail = 4) {
+  const s = String(value || "");
+  return s.length <= head + tail ? s : `${s.slice(0, head)}...${s.slice(-tail)}`;
+}
+
+export function shortPoolId(poolId) {
+  return shortHash(poolId, 10, 8);
+}
+
+const TZ_LABELS = {
+  "Asia/Shanghai": "北京",
+  "Asia/Taipei": "台北",
+  "Asia/Hong_Kong": "香港",
+  UTC: "UTC"
+};
+
+// 紧凑展示时间（无秒），带友好时区标签，例如 "2026/05/20 22:00 北京"
+export function formatUiTime(ts, timezone = "Asia/Shanghai") {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return String(ts);
+  try {
+    const parts = new Intl.DateTimeFormat("zh-CN", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(new Date(n * 1000));
+    const g = (t) => parts.find((p) => p.type === t)?.value || "";
+    return `${g("year")}/${g("month")}/${g("day")} ${g("hour")}:${g("minute")} ${TZ_LABELS[timezone] || timezone}`;
+  } catch {
+    return new Date(n * 1000).toISOString();
   }
 }
 
@@ -299,7 +344,7 @@ export function buildPoolKeyboard({ poolId, txHash, secondRow = [] } = {}) {
   const rows = [];
   const r1 = [];
   const purl = pancakePoolUrl(poolId);
-  if (purl) r1.push({ text: "🥞 Pancake Pool", url: purl });
+  if (purl) r1.push({ text: "🥞 Alpha 池子", url: purl });
   const turl = bscscanTxUrl(txHash);
   if (turl) r1.push({ text: "🔎 BscScan Tx", url: turl });
   if (r1.length) rows.push(r1);
