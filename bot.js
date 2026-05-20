@@ -9,17 +9,38 @@ const {
   TARGET_CONTRACT = "0xb0bb171D333569CfD28a37F5c5DdDAAa90aD46af",
   FILTER_FROM = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E",
   START_BLOCK,
-  POLL_MS = "3000",
-  MAX_BLOCKS_PER_TICK = "20",
+  POLL_MS = "30000",
+  MAX_BLOCKS_PER_TICK = "40",
   TIMEZONE = "Asia/Taipei",
   // Railway 文件系统是临时的，重启后会丢失。想持久化游标，
   // 可挂载 Railway Volume 并把 CURSOR_FILE 指向挂载路径，例如 /data/lastBlock.txt
-  CURSOR_FILE = "./lastBlock.txt"
+  CURSOR_FILE = "./lastBlock.txt",
+  // 白名单 TG 用户 ID，逗号分隔。只有这些用户能用控制命令（/status /test /preview）。
+  // 留空 = 没有人能控制（任何人都可用 /id 查到自己的 ID 再加进来）。
+  WHITELIST_IDS = ""
 } = process.env;
 
 if (!RPC_URL) throw new Error("缺少 RPC_URL");
 if (!TG_BOT_TOKEN) throw new Error("缺少 TG_BOT_TOKEN");
 if (!TG_CHAT_ID) throw new Error("缺少 TG_CHAT_ID");
+
+// TG_CHAT_ID 支持逗号分隔多个会话（私聊 / 群 / 频道），告警会推给每一个。
+const alertChatIds = String(TG_CHAT_ID)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// 控制命令白名单
+const whitelist = new Set(
+  String(WHITELIST_IDS)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
+const startedAt = Date.now();
+let botUsername = "";
+let botId = 0;
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 // ethers 的 Provider 是只读链上连接，可查询 block / transaction / receipt 等信息。
@@ -155,22 +176,40 @@ async function getTokenMeta(address) {
   return meta;
 }
 
-async function sendTelegram(text) {
-  const res = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      chat_id: TG_CHAT_ID,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    })
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function tgApi(method, payload = {}, timeoutMs = 15000) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data?.ok) console.error(`Telegram ${method} 失败:`, JSON.stringify(data));
+    return data;
+  } catch (err) {
+    console.error(`Telegram ${method} 异常:`, err?.message || err);
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+async function sendMessage(chatId, text, extra = {}) {
+  const data = await tgApi("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...extra
   });
-  if (!res.ok) {
-    const body = await res.text();
-    console.error("Telegram 推送失败:", body);
+  return Boolean(data?.ok);
+}
+
+// 告警推送：发给所有配置的会话
+async function sendTelegram(text) {
+  for (const chatId of alertChatIds) {
+    await sendMessage(chatId, text);
   }
 }
 
@@ -288,6 +327,276 @@ async function tick() {
   }
 }
 
+// ---------------- 交互命令层（菜单 / 白名单 / 群组） ----------------
+
+function isWhitelisted(userId) {
+  return whitelist.size > 0 && whitelist.has(String(userId));
+}
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return [d ? `${d}天` : "", h ? `${h}时` : "", m ? `${m}分` : "", `${sec}秒`]
+    .filter(Boolean)
+    .join("");
+}
+
+function buildHelpMessage() {
+  return [
+    `🤖 <b>BSC Initialize Pool 监听机器人</b>`,
+    ``,
+    `监听合约 <code>${shortAddr(targetContract)}</code> 上的 <code>initializePool</code> 调用，`,
+    `命中后把新池信息推送到 Telegram。`,
+    ``,
+    `<b>命令</b>`,
+    `/help - 显示本帮助`,
+    `/id - 查看你的 TG 用户 ID 和当前会话 ID`,
+    `/status - 查看运行状态（白名单）`,
+    `/test - 检查 RPC 与 Telegram 连接（白名单）`,
+    `/preview [txHash] - 预览告警消息格式；带 txHash 则预览真实交易（白名单）`,
+    ``,
+    `🔒 控制命令仅限白名单用户。其它人无法控制本机器人。`,
+    `👥 群里使用命令请用 <code>/命令@${escapeHtml(botUsername || "机器人用户名")}</code>，或在 BotFather 关闭 Privacy 模式。`
+  ].join("\n");
+}
+
+async function buildStatusMessage() {
+  let latest = null;
+  let chainId = "?";
+  try {
+    latest = await provider.getBlockNumber();
+    const net = await provider.getNetwork();
+    chainId = net.chainId.toString();
+  } catch (err) {
+    return `⚠️ 读取链上状态失败: <code>${escapeHtml(err?.message || err)}</code>`;
+  }
+  const cursor = await readCursor();
+  const lag = cursor !== null && latest !== null ? latest - cursor : "?";
+  return [
+    `📊 <b>运行状态</b>`,
+    ``,
+    `<b>运行时长:</b> ${formatUptime(Date.now() - startedAt)}`,
+    `<b>chainId:</b> <code>${chainId}</code>${chainId === "56" ? " (BSC)" : ""}`,
+    `<b>监听合约:</b> <code>${targetContract}</code>`,
+    `<b>From 过滤:</b> ${filterFrom ? `<code>${filterFrom}</code>` : "未限制（所有调用者）"}`,
+    `<b>方法选择器:</b> <code>${methodSelector}</code>`,
+    ``,
+    `<b>最新区块:</b> <code>${latest}</code>`,
+    `<b>已扫描到:</b> <code>${cursor ?? "未初始化"}</code>`,
+    `<b>落后:</b> <code>${lag}</code> 个区块`,
+    `<b>检查间隔:</b> <code>${Number(POLL_MS) / 1000}</code> 秒`,
+    `<b>告警会话:</b> <code>${escapeHtml(alertChatIds.join(", "))}</code>`,
+    `<b>白名单人数:</b> <code>${whitelist.size}</code>`
+  ].join("\n");
+}
+
+async function runConnectivityTest() {
+  const lines = [`🔎 <b>连接检查</b>`, ``];
+
+  // RPC
+  const t0 = Date.now();
+  try {
+    const latest = await provider.getBlockNumber();
+    const net = await provider.getNetwork();
+    lines.push(
+      `✅ RPC 正常：最新区块 <code>${latest}</code>，chainId <code>${net.chainId}</code>（${Date.now() - t0}ms）`
+    );
+    if (net.chainId !== 56n) lines.push(`⚠️ chainId 不是 56，可能不是 BSC 主网。`);
+  } catch (err) {
+    lines.push(`❌ RPC 失败：<code>${escapeHtml(err?.message || err)}</code>`);
+  }
+
+  // Telegram 推送（向所有告警会话发一条测试消息）
+  let okCount = 0;
+  for (const chatId of alertChatIds) {
+    const ok = await sendMessage(chatId, `✅ 测试消息：告警会话 <code>${escapeHtml(chatId)}</code> 推送正常。`);
+    if (ok) okCount++;
+  }
+  lines.push(`📨 告警推送：${okCount}/${alertChatIds.length} 个会话发送成功。`);
+
+  return lines.join("\n");
+}
+
+async function buildPreviewSample() {
+  // 用真实的 BSC 代币地址构造示例，预览渲染效果（非真实告警）
+  const sampleKey = {
+    currency0: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", // WBNB
+    currency1: "0x55d398326f99059fF775485246999027B3197955", // USDT (BSC)
+    hooks: targetContract,
+    poolManager: targetContract,
+    fee: 2500,
+    parameters: "0x" + "00".repeat(32)
+  };
+  const data = iface.encodeFunctionData("initializePool", [
+    sampleKey,
+    BigInt(Math.floor(Date.now() / 1000) + 3600),
+    1940000000000000000000000000000n
+  ]);
+  const parsed = iface.parseTransaction({ data, value: 0 });
+  const sampleTx = {
+    hash: "0x0000000000000000000000000000000000000000000000000000000000000000",
+    from: filterFrom || targetContract,
+    to: targetContract,
+    data
+  };
+  const body = await buildAlertMessage(sampleTx, "（示例）", parsed);
+  return `🔎 <b>预览示例（非真实告警）</b>\n\n${body}`;
+}
+
+async function buildPreviewForTx(txHash) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    return `⚠️ txHash 格式不对，应为 0x 开头的 66 位哈希。`;
+  }
+  let tx;
+  try {
+    tx = await provider.getTransaction(txHash);
+  } catch (err) {
+    return `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>`;
+  }
+  if (!tx) return `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>`;
+
+  const txTo = tx.to ? tx.to.toLowerCase() : "";
+  const data = (tx.data || "").toLowerCase();
+  if (txTo !== targetContract.toLowerCase()) {
+    return `⚠️ 该交易的 To 不是目标合约，无法当作 initializePool 预览。`;
+  }
+  if (!data.startsWith(methodSelector)) {
+    return `⚠️ 该交易不是 initializePool 调用（方法选择器不匹配）。`;
+  }
+  try {
+    const parsed = iface.parseTransaction({ data: tx.data, value: tx.value ?? 0 });
+    const body = await buildAlertMessage(tx, tx.blockNumber ?? "pending", parsed);
+    return `🔎 <b>预览（真实交易）</b>\n\n${body}`;
+  } catch (err) {
+    return `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>`;
+  }
+}
+
+async function handleUpdate(update) {
+  // 被拉进群时打个招呼
+  if (update.my_chat_member) {
+    const m = update.my_chat_member;
+    const status = m.new_chat_member?.status;
+    const who = m.new_chat_member?.user;
+    if (who && botId && who.id === botId && (status === "member" || status === "administrator")) {
+      await sendMessage(
+        m.chat.id,
+        `👋 我是 BSC InitializePool 监听机器人。发送 /help 查看命令；控制命令仅限白名单用户。`
+      );
+    }
+    return;
+  }
+
+  const msg = update.message;
+  const text = msg?.text;
+  if (!msg || typeof text !== "string" || !text.startsWith("/")) return;
+
+  const chatId = msg.chat.id;
+  const userId = msg.from?.id;
+
+  let [cmdRaw, ...args] = text.trim().split(/\s+/);
+  let cmd = cmdRaw.toLowerCase();
+  // 处理群里的 /命令@机器人用户名
+  if (cmd.includes("@")) {
+    const [name, mention] = cmd.split("@");
+    if (botUsername && mention !== botUsername.toLowerCase()) return; // 指向别的 bot
+    cmd = name;
+  }
+
+  const requireWhitelist = async () => {
+    if (isWhitelisted(userId)) return true;
+    await sendMessage(
+      chatId,
+      `⛔ 你没有权限控制本机器人。\n你的 ID: <code>${userId}</code>，请联系管理员把它加入 WHITELIST_IDS。`
+    );
+    return false;
+  };
+
+  switch (cmd) {
+    case "/start":
+    case "/help":
+      await sendMessage(chatId, buildHelpMessage());
+      break;
+    case "/id":
+      await sendMessage(
+        chatId,
+        `你的用户 ID: <code>${userId}</code>\n当前会话 ID: <code>${chatId}</code>\n白名单状态: ${
+          isWhitelisted(userId) ? "✅ 已授权" : "❌ 未授权"
+        }`
+      );
+      break;
+    case "/status":
+      if (await requireWhitelist()) await sendMessage(chatId, await buildStatusMessage());
+      break;
+    case "/test":
+    case "/check":
+      if (await requireWhitelist()) await sendMessage(chatId, await runConnectivityTest());
+      break;
+    case "/preview":
+      if (await requireWhitelist()) {
+        const out = args[0] ? await buildPreviewForTx(args[0]) : await buildPreviewSample();
+        await sendMessage(chatId, out);
+      }
+      break;
+    default:
+      // 未知命令静默忽略，避免群里刷屏
+      break;
+  }
+}
+
+let tgOffset = 0;
+async function pollTelegram() {
+  // 长轮询 getUpdates，与区块扫描并行运行，无需公网 webhook，适合 Railway。
+  while (true) {
+    try {
+      const data = await tgApi(
+        "getUpdates",
+        { offset: tgOffset, timeout: 30, allowed_updates: ["message", "my_chat_member"] },
+        40000
+      );
+      if (data?.ok && Array.isArray(data.result)) {
+        for (const upd of data.result) {
+          tgOffset = upd.update_id + 1;
+          try {
+            await handleUpdate(upd);
+          } catch (err) {
+            console.error("处理更新出错:", err?.message || err);
+          }
+        }
+      } else {
+        await sleep(2000);
+      }
+    } catch (err) {
+      console.error("getUpdates 循环异常:", err?.message || err);
+      await sleep(3000);
+    }
+  }
+}
+
+async function setupTelegram() {
+  const me = await tgApi("getMe");
+  if (me?.ok) {
+    botUsername = me.result.username || "";
+    botId = me.result.id || 0;
+    console.log("bot:", `@${botUsername}`, `(id=${botId})`);
+  } else {
+    console.warn("getMe 失败，交互命令可能不可用（检查 TG_BOT_TOKEN）。");
+  }
+  await tgApi("setMyCommands", {
+    commands: [
+      { command: "help", description: "显示帮助与命令列表" },
+      { command: "id", description: "查看你的 TG ID 和会话 ID" },
+      { command: "status", description: "查看机器人运行状态" },
+      { command: "test", description: "检查 RPC / Telegram 连接" },
+      { command: "preview", description: "预览告警消息（可加 txHash）" }
+    ]
+  });
+  console.log("whitelist:", whitelist.size ? [...whitelist].join(", ") : "（空，暂无人可控制）");
+}
+
 async function main() {
   const network = await provider.getNetwork();
   console.log("BSC Initialize Pool TG Bot started");
@@ -296,9 +605,19 @@ async function main() {
   console.log("filterFrom:", filterFrom || "未限制 From，监听所有调用者");
   console.log("methodSelector:", methodSelector);
   console.log("cursorFile:", CURSOR_FILE);
+  console.log("pollMs:", POLL_MS);
   if (network.chainId !== 56n) {
     console.warn("警告：当前 RPC chainId 不是 56，可能不是 BSC 主网。");
   }
+
+  // 交互命令层（菜单 / 白名单 / 群组），best-effort：失败不影响区块扫描
+  try {
+    await setupTelegram();
+    pollTelegram();
+  } catch (err) {
+    console.error("初始化 Telegram 交互层失败:", err?.message || err);
+  }
+
   await tick();
   setInterval(tick, Number(POLL_MS));
 }
