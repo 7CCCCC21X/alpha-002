@@ -55,8 +55,9 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `/help`（`/start`） | 所有人 | 显示帮助与命令列表 |
 | `/id` | 所有人 | 查看你的 TG 用户 ID 和当前会话 ID（用来配白名单） |
 | `/status` | 白名单 | 运行状态：链 ID、监听合约、From 过滤、最新块、已扫到哪、落后多少、检查间隔、运行时长 |
-| `/test`（`/check`） | 白名单 | 检查 RPC（报最新块和延迟）并向所有告警会话发测试消息确认推送可用 |
-| `/preview [txHash]` | 白名单 | 不带参数渲染示例告警；带 txHash 则拉真实交易解码后预览（支持两种方法） |
+| `/test` | 白名单 | 检查 RPC（报最新块和延迟）并向所有告警会话发测试消息确认推送可用 |
+| `/check <txHash>` | 白名单 | 检查这笔交易是否命中推送规则：逐项给出 To / 方法 / From 过滤 / 交易状态，并给结论；命中则附上会推送的内容 |
+| `/preview [txHash]` | 白名单 | 不带参数渲染示例告警；带 txHash 则拉真实交易解码后预览（不校验 From） |
 | `/pool <poolId>` | 白名单 | 查询池子：币对、PancakeSwap 链接、初始价格、链上**当前价格**（读 `getSlot0`）、Init Tx |
 | `/import <txHash>` | 白名单 | 把历史 `initializePool` 交易解码并导入 `pools.json`，之后 `/pool` 和 `addPoolOwners` 都能用 |
 | `/last [n]` | 白名单 | 查看最近 n 条告警（默认 5，最多 20） |

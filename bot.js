@@ -495,6 +495,67 @@ async function buildPreviewForTx(txHash) {
   }
 }
 
+// /check <txHash>：逐项检查这笔交易会不会被本机器人推送
+async function buildHitCheck(txHash) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(txHash || ""))) {
+    return { text: `⚠️ 用法：/check &lt;txHash&gt;（检查这笔交易是否命中推送规则）` };
+  }
+  let tx;
+  try {
+    tx = await withTimeout(provider.getTransaction(txHash), rpcTimeoutMs, "getTransaction");
+  } catch (err) {
+    return { text: `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>` };
+  }
+  if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
+
+  const txTo = (tx.to || "").toLowerCase();
+  const txFrom = (tx.from || "").toLowerCase();
+  const method = matchedMethod(tx.data);
+  const toMatch = txTo === targetContract.toLowerCase();
+  const fromMatch = !filterFrom || txFrom === filterFrom.toLowerCase();
+
+  let statusOk = null;
+  try {
+    const receipt = await withTimeout(
+      provider.getTransactionReceipt(txHash),
+      rpcTimeoutMs,
+      "getTransactionReceipt"
+    );
+    statusOk = receipt ? receipt.status === 1 : null;
+  } catch {}
+
+  const yn = (ok) => (ok ? "✅" : "❌");
+  const lines = [
+    `🔎 <b>命中检查</b>`,
+    `<b>Tx:</b> <a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`,
+    ``,
+    `${yn(toMatch)} <b>To 目标合约:</b> ${toMatch ? "匹配" : `不匹配（实际 ${shortAddr(tx.to || "无")}）`}`,
+    `${yn(!!method)} <b>方法:</b> ${method ? `${method}` : "不是 initializePool / addPoolOwners"}`,
+    filterFrom
+      ? `${yn(fromMatch)} <b>From 过滤:</b> ${fromMatch ? "通过" : `被过滤（实际 ${shortAddr(tx.from)}，需要 ${shortAddr(filterFrom)}）`}`
+      : `⏭️ <b>From 过滤:</b> 未启用（监听所有调用者）`,
+    `${yn(statusOk === true)} <b>交易状态:</b> ${
+      statusOk === true ? "success" : statusOk === false ? "failed（不会推）" : "未知/未确认"
+    }`
+  ];
+
+  const hit = toMatch && !!method && fromMatch && statusOk === true;
+  lines.push(``, hit ? `<b>结论:</b> ✅ 会被推送` : `<b>结论:</b> ❌ 不会被推送`);
+
+  // 命中的话，把会推送的告警一起渲染出来
+  if (hit) {
+    try {
+      const parsed = iface.parseTransaction({ data: tx.data, value: tx.value ?? 0 });
+      const m = await buildMessageForMethod(method, tx, tx.blockNumber ?? "pending", parsed);
+      return {
+        text: `${lines.join("\n")}\n\n— — — 推送内容 — — —\n${m.text}`,
+        reply_markup: m.reply_markup
+      };
+    } catch {}
+  }
+  return { text: lines.join("\n") };
+}
+
 function recordAlert(entry) {
   lastAlert = { ...entry, time: Date.now() };
   recentAlerts.unshift(lastAlert);
@@ -519,6 +580,7 @@ function buildHelpMessage() {
     `/id - 查看你的 TG 用户 ID 和当前会话 ID`,
     `/status - 查看运行状态（白名单）`,
     `/test - 检查 RPC 与 Telegram 连接（白名单）`,
+    `/check &lt;txHash&gt; - 检查这笔交易是否命中推送规则（白名单）`,
     `/preview [txHash] - 预览告警；带 txHash 则预览真实交易（白名单）`,
     `/pool &lt;poolId&gt; - 查询池子信息 / 当前价格 / PancakeSwap 链接（白名单）`,
     `/import &lt;txHash&gt; - 导入历史 initializePool 交易到本地缓存（白名单）`,
@@ -676,8 +738,10 @@ async function handleUpdate(update) {
       if (await requireWhitelist()) await sendMessage(chatId, await buildStatusMessage());
       break;
     case "/test":
-    case "/check":
       if (await requireWhitelist()) await sendMessage(chatId, await runConnectivityTest());
+      break;
+    case "/check":
+      if (await requireWhitelist()) await reply(chatId, await buildHitCheck(args[0]));
       break;
     case "/preview":
       if (await requireWhitelist())
@@ -743,6 +807,7 @@ async function setupTelegram() {
       { command: "id", description: "查看你的 TG ID 和会话 ID" },
       { command: "status", description: "查看机器人运行状态" },
       { command: "test", description: "检查 RPC / Telegram 连接" },
+      { command: "check", description: "检查某笔交易是否命中推送规则" },
       { command: "preview", description: "预览告警消息（可加 txHash）" },
       { command: "pool", description: "查询池子信息 / PancakeSwap 链接" },
       { command: "import", description: "导入历史 initializePool 交易" },
