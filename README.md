@@ -26,6 +26,9 @@ poolId / fee 跟链上真实值**不一致**。机器人解析交易回执里 **
 
 这样 `initializePool` 显示的 PoolId 就和后续 `addPoolOwners` 引用的 poolId 一致，两条消息能正确关联。
 
+此外，Hook 自己还会 emit `PoolStartedAtUpdated(bytes32 indexed poolId, uint256 startedTimestamp, address operator)`，
+机器人用它作为 poolId 的备用来源，并用 `startedTimestamp` 作为准确的「开始时间」。两个事件的 topic0 都已和链上实际日志核对一致。
+
 ### addPoolOwners 回复初始化消息
 
 同一个 poolId 的 `addPoolOwners` 告警会以 Telegram **回复**的形式挂在该池子的「新池初始化」消息下面，

@@ -10,6 +10,7 @@ import {
   matchedMethod,
   computePoolId,
   parseCLInitializeEvent,
+  parseHookPoolStartedEvent,
   isValidPoolId,
   pancakePoolUrl,
   bscscanAddressUrl,
@@ -253,20 +254,25 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt) {
   const poolManager = ethers.getAddress(key.poolManager ?? key[3]);
   const inputFee = key.fee ?? key[4];
   const inputParameters = key.parameters ?? key[5];
-  const startTimestamp = parsed.args.startTimestamp ?? parsed.args[1];
+  const inputStartTimestamp = parsed.args.startTimestamp ?? parsed.args[1];
   const inputSqrtPriceX96 = parsed.args.sqrtPriceX96 ?? parsed.args[2];
 
   // Hook 会改写 PoolKey 再调 PoolManager，真实 poolId / fee / sqrtPriceX96
   // 以 CLPoolManager 的 Initialize 事件为准；事件取不到再回退到 Hook 入参。
+  // Hook 自己的 PoolStartedAtUpdated 事件提供真实 poolId（备用）和准确开始时间。
   const realInit = parseCLInitializeEvent(receipt?.logs, poolManager);
+  const hookStarted = parseHookPoolStartedEvent(receipt?.logs, targetContract);
   const currency0 = realInit?.currency0 ?? inputCurrency0;
   const currency1 = realInit?.currency1 ?? inputCurrency1;
   const hooks = realInit?.hooks ?? inputHooks;
   const fee = realInit?.fee ?? inputFee;
   const parameters = realInit?.parameters ?? inputParameters;
   const sqrtPriceX96 = realInit?.sqrtPriceX96 ?? inputSqrtPriceX96;
+  const startTimestamp = hookStarted?.startedTimestamp ?? inputStartTimestamp;
   const poolId =
-    realInit?.poolId ?? computePoolId(currency0, currency1, hooks, poolManager, fee, parameters);
+    realInit?.poolId ??
+    hookStarted?.poolId ??
+    computePoolId(currency0, currency1, hooks, poolManager, fee, parameters);
 
   const [t0, t1] = await Promise.all([getTokenMeta(currency0), getTokenMeta(currency1)]);
   const pair = `${t0.symbol} / ${t1.symbol}`;

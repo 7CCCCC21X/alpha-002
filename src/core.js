@@ -91,6 +91,43 @@ export function parseCLInitializeEvent(logs, expectedPoolManager) {
   return scan(expected) || (expected ? scan(null) : null);
 }
 
+// CLAlphaHook 自己也会 emit PoolStartedAtUpdated(bytes32 indexed poolId, uint256 startedTimestamp, address operator)
+// 里面带真实 poolId 和准确的开始时间，可作为 poolId 的备用来源 + 准确开始时间。
+export const HOOK_EVENT_ABI = [
+  "event PoolStartedAtUpdated(bytes32 indexed poolId, uint256 startedTimestamp, address operator)"
+];
+
+const hookEventIface = new ethers.Interface(HOOK_EVENT_ABI);
+
+export function parseHookPoolStartedEvent(logs, hookAddress) {
+  if (!Array.isArray(logs)) return null;
+  let expected = null;
+  try {
+    expected = ethers.getAddress(hookAddress).toLowerCase();
+  } catch {}
+
+  const scan = (filterAddr) => {
+    for (const log of logs) {
+      if (filterAddr && log.address?.toLowerCase() !== filterAddr) continue;
+      let ev;
+      try {
+        ev = hookEventIface.parseLog({ topics: Array.from(log.topics || []), data: log.data });
+      } catch {
+        continue;
+      }
+      if (ev?.name !== "PoolStartedAtUpdated") continue;
+      return {
+        poolId: String(ev.args.poolId).toLowerCase(),
+        startedTimestamp: ev.args.startedTimestamp,
+        operator: ethers.getAddress(ev.args.operator)
+      };
+    }
+    return null;
+  };
+
+  return scan(expected) || (expected ? scan(null) : null);
+}
+
 export const iface = new ethers.Interface(HOOK_ABI);
 const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 export const SEL_INIT_POOL = iface.getFunction("initializePool").selector.toLowerCase();

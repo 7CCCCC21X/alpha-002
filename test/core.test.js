@@ -6,7 +6,9 @@ import {
   matchedMethod,
   computePoolId,
   parseCLInitializeEvent,
+  parseHookPoolStartedEvent,
   CL_POOL_MANAGER_ABI,
+  HOOK_EVENT_ABI,
   isValidPoolId,
   isTxHash,
   pancakePoolUrl,
@@ -116,6 +118,27 @@ describe("parseCLInitializeEvent", () => {
   it("returns null when there is no Initialize log", () => {
     expect(parseCLInitializeEvent([], poolManager)).toBe(null);
     expect(parseCLInitializeEvent(null, poolManager)).toBe(null);
+  });
+});
+
+describe("parseHookPoolStartedEvent", () => {
+  const hookIface = new ethers.Interface(HOOK_EVENT_ABI);
+  const hook = "0xb0bb171D333569CfD28a37F5c5DdDAAa90aD46af";
+  const poolId = "0xae74941d0ff92e1e6c26a11fa0762ef29b87786e60daf62be00477288ec41abd";
+  const operator = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E";
+
+  it("topic0 matches the on-chain PoolStartedAtUpdated event", () => {
+    expect(hookIface.getEvent("PoolStartedAtUpdated").topicHash.toLowerCase()).toBe(
+      "0xcaccc4bc886d75b13de806bf4292e4cc78a042eae40849e6a96242f7d03cb5fb"
+    );
+  });
+  it("extracts poolId and accurate startedTimestamp", () => {
+    const enc = hookIface.encodeEventLog("PoolStartedAtUpdated", [poolId, 1779285600, operator]);
+    const log = { address: hook, topics: enc.topics, data: enc.data };
+    const r = parseHookPoolStartedEvent([log], hook);
+    expect(r.poolId).toBe(poolId.toLowerCase());
+    expect(r.startedTimestamp).toBe(1779285600n);
+    expect(r.operator.toLowerCase()).toBe(operator.toLowerCase());
   });
 });
 
