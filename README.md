@@ -25,6 +25,19 @@
 - 缓存只在**本次运行内**有效；重启后会清空。对历史池子或重启前初始化的池子，`addPoolOwners` 告警只显示 poolId。
 - poolId 计算用的是标准 v4 / Infinity 编码方案。部署后可用 `/preview <initializePool 交易哈希>` 比对算出的 PoolId 是否与链上 Initialize 事件里的 id 一致来验证。
 
+### PancakeSwap 池子链接
+
+只要有 poolId，就能直接拼出池子链接，无需额外查询：
+
+```
+https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
+```
+
+所有涉及 poolId 的告警 / 命令（`initializePool`、`addPoolOwners`、`/preview`、`/pool`）都会：
+
+- 在消息正文里加一行 `PancakeSwap: Open Pool` 链接；
+- 在消息底部附带内联按钮 **🥞 Pancake Pool** 和 **🔎 BscScan Tx**（示例预览的零哈希交易不显示 BscScan 按钮）。
+
 ## Telegram 命令
 
 启动时会自动注册命令菜单（输入框旁的菜单按钮）。
@@ -36,6 +49,7 @@
 | `/status` | 白名单 | 运行状态：链 ID、监听合约、From 过滤、最新块、已扫到哪、落后多少、检查间隔、运行时长 |
 | `/test`（`/check`） | 白名单 | 检查 RPC（报最新块和延迟）并向所有告警会话发测试消息确认推送可用 |
 | `/preview [txHash]` | 白名单 | 不带参数渲染示例告警；带 txHash 则拉真实交易解码后预览（支持两种方法） |
+| `/pool <poolId>` | 白名单 | 由 poolId 生成 PancakeSwap 池子链接；若该池在本次运行内见过则补充币对 / 初始价格 |
 
 只有白名单内的用户能用控制命令，其它人无法控制本机器人。
 

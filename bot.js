@@ -118,8 +118,31 @@ function matchedMethod(data) {
   return null;
 }
 
+function isValidPoolId(poolId) {
+  return typeof poolId === "string" && /^0x[a-fA-F0-9]{64}$/.test(poolId);
+}
+
+function pancakePoolUrl(poolId) {
+  return isValidPoolId(poolId)
+    ? `https://pancakeswap.finance/liquidity/pool/bsc/${poolId}`
+    : null;
+}
+
+function isTxHash(hash) {
+  return typeof hash === "string" && /^0x[0-9a-fA-F]{64}$/.test(hash) && !/^0x0+$/.test(hash);
+}
+
+// 组装告警消息底部的内联按钮：🥞 Pancake Pool / 🔎 BscScan Tx
+function alertButtons(poolId, txHash) {
+  const row = [];
+  const url = pancakePoolUrl(poolId);
+  if (url) row.push({ text: "🥞 Pancake Pool", url });
+  if (isTxHash(txHash)) row.push({ text: "🔎 BscScan Tx", url: `https://bscscan.com/tx/${txHash}` });
+  return row.length ? { inline_keyboard: [row] } : undefined;
+}
+
 const tokenCache = new Map();
-// poolId(lowercase) -> { token0, token1, fee }
+// poolId(lowercase) -> { token0, token1, fee, price }
 const poolCache = new Map();
 
 function shortAddr(addr) {
@@ -246,9 +269,9 @@ async function sendMessage(chatId, text, extra = {}) {
 }
 
 // 告警推送：发给所有配置的会话
-async function sendTelegram(text) {
+async function sendTelegram(text, extra = {}) {
   for (const chatId of alertChatIds) {
-    await sendMessage(chatId, text);
+    await sendMessage(chatId, text, extra);
   }
 }
 
@@ -275,18 +298,21 @@ async function buildAlertMessage(tx, blockNumber, parsed) {
 
   const [t0, t1] = await Promise.all([getTokenMeta(currency0), getTokenMeta(currency1)]);
 
-  const poolId = computePoolId(currency0, currency1, hooks, poolManager, fee, parameters);
-  if (poolId) poolCache.set(poolId, { token0: t0, token1: t1, fee });
-
-  let priceLine = "";
+  let price = null;
   try {
-    const price = priceFromSqrtX96(sqrtPriceX96, t0.decimals, t1.decimals);
-    priceLine = `\n<b>初始价格:</b> 1 ${escapeHtml(t0.symbol)} ≈ <code>${price}</code> ${escapeHtml(
-      t1.symbol
-    )}`;
+    price = priceFromSqrtX96(sqrtPriceX96, t0.decimals, t1.decimals);
   } catch {}
 
-  return [
+  const poolId = computePoolId(currency0, currency1, hooks, poolManager, fee, parameters);
+  if (poolId) poolCache.set(poolId, { token0: t0, token1: t1, fee, price });
+
+  const poolUrl = pancakePoolUrl(poolId);
+  const priceLine =
+    price !== null
+      ? `\n<b>初始价格:</b> 1 ${escapeHtml(t0.symbol)} ≈ <code>${price}</code> ${escapeHtml(t1.symbol)}`
+      : "";
+
+  const text = [
     `🚨 <b>BSC Initialize Pool 监听到新池</b>`,
     ``,
     `<b>区块:</b> <code>${blockNumber}</code>`,
@@ -295,6 +321,7 @@ async function buildAlertMessage(tx, blockNumber, parsed) {
     `<b>To:</b> <code>${ethers.getAddress(tx.to)}</code>`,
     ``,
     poolId ? `<b>PoolId:</b> <code>${poolId}</code>` : null,
+    poolUrl ? `<b>PancakeSwap:</b> <a href="${poolUrl}">Open Pool</a>` : null,
     `<b>Token0:</b> ${escapeHtml(t0.symbol)} <code>${currency0}</code>`,
     `<b>Token1:</b> ${escapeHtml(t1.symbol)} <code>${currency1}</code>`,
     `<b>Hooks:</b> <code>${hooks}</code>`,
@@ -308,11 +335,14 @@ async function buildAlertMessage(tx, blockNumber, parsed) {
   ]
     .filter((line) => line !== null)
     .join("\n");
+
+  return { text, reply_markup: alertButtons(poolId, tx.hash) };
 }
 
 async function buildAddOwnersMessage(tx, blockNumber, parsed) {
   const poolId = String(parsed.args.poolId ?? parsed.args[0]).toLowerCase();
   const owners = (parsed.args.owners ?? parsed.args[1] ?? []).map((a) => ethers.getAddress(a));
+  const poolUrl = pancakePoolUrl(poolId);
 
   const lines = [
     `👤 <b>BSC Add Pool Owners 监听到加管理员</b>`,
@@ -324,6 +354,7 @@ async function buildAddOwnersMessage(tx, blockNumber, parsed) {
     ``,
     `<b>PoolId:</b> <code>${poolId}</code>`
   ];
+  if (poolUrl) lines.push(`<b>PancakeSwap:</b> <a href="${poolUrl}">Open Pool</a>`);
 
   // 若该 poolId 在本次运行里见过 initializePool，补充币对信息
   const cached = poolCache.get(poolId);
@@ -338,13 +369,36 @@ async function buildAddOwnersMessage(tx, blockNumber, parsed) {
   lines.push(``, `<b>新增 Owners (${owners.length}):</b>`);
   for (const o of owners) lines.push(`• <code>${o}</code>`);
 
-  return lines.join("\n");
+  return { text: lines.join("\n"), reply_markup: alertButtons(poolId, tx.hash) };
 }
 
 async function buildMessageForMethod(method, tx, blockNumber, parsed) {
   return method === "addPoolOwners"
     ? buildAddOwnersMessage(tx, blockNumber, parsed)
     : buildAlertMessage(tx, blockNumber, parsed);
+}
+
+// poolId 信息卡片：只要有合法 poolId 就能生成 PancakeSwap 链接，币对/价格若缓存过则补充
+function buildPoolInfo(poolId) {
+  const pid = String(poolId || "").toLowerCase();
+  if (!isValidPoolId(pid)) {
+    return { text: `⚠️ poolId 格式不对，应为 0x 开头的 64 位十六进制。用法：/pool &lt;poolId&gt;` };
+  }
+  const url = pancakePoolUrl(pid);
+  const lines = [`🔎 <b>Pool Info</b>`, ``];
+  const cached = poolCache.get(pid);
+  if (cached) {
+    lines.push(`<b>Pair:</b> ${escapeHtml(cached.token0.symbol)} / ${escapeHtml(cached.token1.symbol)}`);
+  }
+  lines.push(`<b>PoolId:</b> <code>${pid}</code>`, `<b>PancakeSwap:</b> <a href="${url}">Open Pool</a>`);
+  if (cached?.price != null) {
+    lines.push(
+      `<b>初始价格:</b> 1 ${escapeHtml(cached.token0.symbol)} ≈ <code>${cached.price}</code> ${escapeHtml(
+        cached.token1.symbol
+      )}`
+    );
+  }
+  return { text: lines.join("\n"), reply_markup: { inline_keyboard: [[{ text: "🥞 Pancake Pool", url }]] } };
 }
 
 async function scanBlock(blockNumber) {
@@ -367,8 +421,8 @@ async function scanBlock(blockNumber) {
         data: tx.input || tx.data,
         value: tx.value ?? 0
       });
-      const msg = await buildMessageForMethod(method, tx, blockNumber, parsed);
-      await sendTelegram(msg);
+      const { text, reply_markup } = await buildMessageForMethod(method, tx, blockNumber, parsed);
+      await sendTelegram(text, reply_markup ? { reply_markup } : {});
       console.log(`[ALERT] method=${method} block=${blockNumber} tx=${tx.hash}`);
     } catch (err) {
       console.error(`解析 ${method} 失败:`, tx.hash, err);
@@ -440,6 +494,7 @@ function buildHelpMessage() {
     `/status - 查看运行状态（白名单）`,
     `/test - 检查 RPC 与 Telegram 连接（白名单）`,
     `/preview [txHash] - 预览告警消息格式；带 txHash 则预览真实交易（白名单）`,
+    `/pool &lt;poolId&gt; - 由 poolId 生成 PancakeSwap 池子链接（白名单）`,
     ``,
     `🔒 控制命令仅限白名单用户。其它人无法控制本机器人。`,
     `👥 群里使用命令请用 <code>/命令@${escapeHtml(botUsername || "机器人用户名")}</code>，或在 BotFather 关闭 Privacy 模式。`
@@ -525,37 +580,37 @@ async function buildPreviewSample() {
     to: targetContract,
     data
   };
-  const body = await buildAlertMessage(sampleTx, "（示例）", parsed);
-  return `🔎 <b>预览示例（非真实告警）</b>\n\n${body}`;
+  const m = await buildAlertMessage(sampleTx, "（示例）", parsed);
+  return { text: `🔎 <b>预览示例（非真实告警）</b>\n\n${m.text}`, reply_markup: m.reply_markup };
 }
 
 async function buildPreviewForTx(txHash) {
   if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
-    return `⚠️ txHash 格式不对，应为 0x 开头的 66 位哈希。`;
+    return { text: `⚠️ txHash 格式不对，应为 0x 开头的 66 位哈希。` };
   }
   let tx;
   try {
     tx = await provider.getTransaction(txHash);
   } catch (err) {
-    return `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>`;
+    return { text: `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>` };
   }
-  if (!tx) return `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>`;
+  if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
 
   const txTo = tx.to ? tx.to.toLowerCase() : "";
   const data = (tx.data || "").toLowerCase();
   if (txTo !== targetContract.toLowerCase()) {
-    return `⚠️ 该交易的 To 不是目标合约，无法预览。`;
+    return { text: `⚠️ 该交易的 To 不是目标合约，无法预览。` };
   }
   const method = matchedMethod(data);
   if (!method) {
-    return `⚠️ 该交易不是 initializePool / addPoolOwners 调用（方法选择器不匹配）。`;
+    return { text: `⚠️ 该交易不是 initializePool / addPoolOwners 调用（方法选择器不匹配）。` };
   }
   try {
     const parsed = iface.parseTransaction({ data: tx.data, value: tx.value ?? 0 });
-    const body = await buildMessageForMethod(method, tx, tx.blockNumber ?? "pending", parsed);
-    return `🔎 <b>预览（真实交易）</b>\n\n${body}`;
+    const m = await buildMessageForMethod(method, tx, tx.blockNumber ?? "pending", parsed);
+    return { text: `🔎 <b>预览（真实交易）</b>\n\n${m.text}`, reply_markup: m.reply_markup };
   } catch (err) {
-    return `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>`;
+    return { text: `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>` };
   }
 }
 
@@ -622,7 +677,13 @@ async function handleUpdate(update) {
     case "/preview":
       if (await requireWhitelist()) {
         const out = args[0] ? await buildPreviewForTx(args[0]) : await buildPreviewSample();
-        await sendMessage(chatId, out);
+        await sendMessage(chatId, out.text, out.reply_markup ? { reply_markup: out.reply_markup } : {});
+      }
+      break;
+    case "/pool":
+      if (await requireWhitelist()) {
+        const out = buildPoolInfo(args[0]);
+        await sendMessage(chatId, out.text, out.reply_markup ? { reply_markup: out.reply_markup } : {});
       }
       break;
     default:
@@ -675,7 +736,8 @@ async function setupTelegram() {
       { command: "id", description: "查看你的 TG ID 和会话 ID" },
       { command: "status", description: "查看机器人运行状态" },
       { command: "test", description: "检查 RPC / Telegram 连接" },
-      { command: "preview", description: "预览告警消息（可加 txHash）" }
+      { command: "preview", description: "预览告警消息（可加 txHash）" },
+      { command: "pool", description: "由 poolId 生成 PancakeSwap 池子链接" }
     ]
   });
   console.log("whitelist:", whitelist.size ? [...whitelist].join(", ") : "（空，暂无人可控制）");
