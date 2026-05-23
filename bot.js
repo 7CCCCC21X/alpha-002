@@ -7,6 +7,7 @@ import {
   iface,
   SEL_INIT_POOL,
   SEL_ADD_OWNERS,
+  SEL_SET_STARTED,
   matchedMethod,
   computePoolId,
   parseCLInitializeEvent,
@@ -29,7 +30,7 @@ const {
   RPC_URL,
   TG_BOT_TOKEN,
   TG_CHAT_ID = "",
-  TARGET_CONTRACT = "0xb0bb171D333569CfD28a37F5c5DdDAAa90aD46af",
+  TARGET_CONTRACT = "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f",
   FILTER_FROM = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E",
   START_BLOCK,
   // BSC 现约 0.75s 出一个块（≈1.33 块/秒）。扫描上限 = MAX_BLOCKS_PER_TICK / (POLL_MS/1000)
@@ -425,10 +426,54 @@ async function buildAddOwnersMessage(tx, blockNumber, parsed) {
   return { text: lines.join("\n") + communityFooter(), reply_markup, pair, poolId };
 }
 
+async function buildPoolStartedMessage(tx, blockNumber, parsed) {
+  const poolId = String(parsed.args.poolId ?? parsed.args[0]).toLowerCase();
+  const ts = Number(parsed.args.timestamp ?? parsed.args[1]);
+  const cached = poolCache.get(poolId);
+  const pair = cached ? `${cached.token0.symbol} / ${cached.token1.symbol}` : null;
+  const tokenSymbol = cached ? escapeHtml(cached.token0.symbol) : "该代币";
+  const when = escapeHtml(formatUiTime(ts, TIMEZONE));
+  const diffSec = ts - Math.floor(Date.now() / 1000);
+  const countdown = Number.isFinite(diffSec)
+    ? diffSec > 0
+      ? `距开盘约 ${formatUptime(diffSec * 1000)}`
+      : `开盘时间已到/已过`
+    : null;
+
+  const lines = [
+    `⏰ <b>Binance Alpha 开盘时间确定｜${pair ? escapeHtml(pair) : "未知池子"}</b>`,
+    ``,
+    `🟢 <b>状态：</b>已设置开盘时间`,
+    `↳ <b>关联池子：</b><code>${shortPoolId(poolId)}</code>`,
+    ``,
+    `🚀 <b>开盘时间：</b>${when}`,
+    countdown ? `⏳ ${countdown}` : null,
+    ``,
+    `📌 <b>结论：</b>`,
+    `${tokenSymbol} 的 Alpha 池子已设定开盘时间，通常意味着即将开放交易。`,
+    ``,
+    `📦 <b>区块：</b><code>${blockNumber}</code>`,
+    `🔎 <b>Tx：</b><a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`
+  ].filter((l) => l !== null);
+  if (!cached) {
+    lines.push(
+      `<i>（本地无该池初始化记录，可用 /import &lt;initializePool 交易哈希&gt; 补全币对）</i>`
+    );
+  }
+
+  const reply_markup = buildPoolKeyboard({
+    poolId,
+    txHash: tx.hash,
+    secondRow: [{ text: "🧩 Hook 合约", url: bscscanAddressUrl(targetContract) }]
+  });
+
+  return { text: lines.join("\n") + communityFooter(), reply_markup, pair, poolId };
+}
+
 async function buildMessageForMethod(method, tx, blockNumber, parsed, receipt) {
-  return method === "addPoolOwners"
-    ? buildAddOwnersMessage(tx, blockNumber, parsed)
-    : buildAlertMessage(tx, blockNumber, parsed, receipt);
+  if (method === "addPoolOwners") return buildAddOwnersMessage(tx, blockNumber, parsed);
+  if (method === "setPoolStartedTimestamp") return buildPoolStartedMessage(tx, blockNumber, parsed);
+  return buildAlertMessage(tx, blockNumber, parsed, receipt);
 }
 
 // /pool 信息卡片
@@ -574,7 +619,9 @@ async function buildPreviewForTx(txHash) {
   }
   const method = matchedMethod(tx.data);
   if (!method) {
-    return { text: `⚠️ 该交易不是 initializePool / addPoolOwners 调用（方法选择器不匹配）。` };
+    return {
+      text: `⚠️ 该交易不是 initializePool / addPoolOwners / setPoolStartedTimestamp 调用（方法选择器不匹配）。`
+    };
   }
   try {
     const parsed = iface.parseTransaction({ data: tx.data, value: tx.value ?? 0 });
@@ -629,7 +676,7 @@ async function buildHitCheck(txHash) {
     `<b>Tx:</b> <a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`,
     ``,
     `${yn(toMatch)} <b>To 目标合约:</b> ${toMatch ? "匹配" : `不匹配（实际 ${shortAddr(tx.to || "无")}）`}`,
-    `${yn(!!method)} <b>方法:</b> ${method ? `${method}` : "不是 initializePool / addPoolOwners"}`,
+    `${yn(!!method)} <b>方法:</b> ${method ? `${method}` : "不是已监听的方法"}`,
     filterFrom
       ? `${yn(fromMatch)} <b>From 过滤:</b> ${fromMatch ? "通过" : `被过滤（实际 ${shortAddr(tx.from)}，需要 ${shortAddr(filterFrom)}）`}`
       : `⏭️ <b>From 过滤:</b> 未启用（监听所有调用者）`,
@@ -677,7 +724,7 @@ function buildHelpMessage() {
   return [
     `🤖 <b>BSC Initialize Pool / Add Pool Owners 监听机器人</b>`,
     ``,
-    `监听合约 <code>${shortAddr(targetContract)}</code> 上的 <code>initializePool</code> 与 <code>addPoolOwners</code>，`,
+    `监听合约 <code>${shortAddr(targetContract)}</code> 上的 <code>initializePool</code>、<code>addPoolOwners</code> 与 <code>setPoolStartedTimestamp</code>，`,
     `命中后推送新池 / 加管理员信息，并附 PancakeSwap 链接与按钮。`,
     ``,
     `<b>命令</b>`,
@@ -718,7 +765,7 @@ async function buildStatusMessage() {
   const cursor = await readCursor();
   const lag = cursor !== null ? confirmed - cursor : "?";
   const la = lastAlert
-    ? `${lastAlert.method === "addPoolOwners" ? "🟠 加管理员" : "🟢 新池"}${
+    ? `${methodTag(lastAlert.method)}${
         lastAlert.pair ? ` ${lastAlert.pair}` : ""
       } ${shortAddr(lastAlert.txHash)}（${formatUptime(Date.now() - lastAlert.time)}前）`
     : "暂无";
@@ -729,7 +776,7 @@ async function buildStatusMessage() {
     `<b>链:</b> chainId <code>${chainId}</code>${chainId === "56" ? " (BSC)" : ""}`,
     `<b>监听合约:</b> <code>${targetContract}</code>`,
     `<b>From 过滤:</b> ${filterFrom ? `<code>${filterFrom}</code>` : "未限制"}`,
-    `<b>监听方法:</b> initializePool <code>${SEL_INIT_POOL}</code> / addPoolOwners <code>${SEL_ADD_OWNERS}</code>`,
+    `<b>监听方法:</b> initializePool <code>${SEL_INIT_POOL}</code> / addPoolOwners <code>${SEL_ADD_OWNERS}</code> / setPoolStartedTimestamp <code>${SEL_SET_STARTED}</code>`,
     ``,
     `<b>最新区块:</b> <code>${latestRaw}</code>`,
     `<b>确认数:</b> <code>${confirmations}</code> → 扫到 <code>${confirmed}</code>`,
@@ -849,12 +896,20 @@ async function buildResync(arg) {
   ].join("\n");
 }
 
+// 告警方法对应的标签（用于 /status、/last 等摘要展示）
+function methodTag(method) {
+  if (method === "addPoolOwners") return "🟠 加管理员";
+  if (method === "setPoolStartedTimestamp") return "⏰ 开盘时间";
+  return "🟢 新池";
+}
+
 function buildLastAlerts(n) {
   const count = Math.min(20, Math.max(1, Number(n) || 5));
   if (recentAlerts.length === 0) return `暂无告警记录。`;
   const lines = [`🕘 <b>最近 ${Math.min(count, recentAlerts.length)} 条告警</b>`, ``];
   for (const a of recentAlerts.slice(0, count)) {
-    const tag = a.method === "addPoolOwners" ? "🟠" : "🟢";
+    const tag =
+      a.method === "addPoolOwners" ? "🟠" : a.method === "setPoolStartedTimestamp" ? "⏰" : "🟢";
     const pair = a.pair ? ` ${escapeHtml(a.pair)}` : "";
     lines.push(
       `${tag}${pair} <a href="https://bscscan.com/tx/${a.txHash}">${shortAddr(a.txHash)}</a> · ${formatUptime(
@@ -1181,7 +1236,11 @@ async function main() {
   console.log("chainId:", network.chainId.toString());
   console.log("targetContract:", targetContract);
   console.log("filterFrom:", filterFrom || "未限制 From，监听所有调用者");
-  console.log("selectors:", { initializePool: SEL_INIT_POOL, addPoolOwners: SEL_ADD_OWNERS });
+  console.log("selectors:", {
+    initializePool: SEL_INIT_POOL,
+    addPoolOwners: SEL_ADD_OWNERS,
+    setPoolStartedTimestamp: SEL_SET_STARTED
+  });
   console.log("cursorFile:", CURSOR_FILE, "| poolsFile:", POOLS_FILE);
   console.log("pollMs:", POLL_MS, "| confirmations:", confirmations);
   console.log(

@@ -37,6 +37,16 @@ export const HOOK_ABI = [
       { name: "owners", type: "address[]" }
     ],
     outputs: []
+  },
+  {
+    type: "function",
+    name: "setPoolStartedTimestamp",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "poolId", type: "bytes32" },
+      { name: "timestamp", type: "uint256" }
+    ],
+    outputs: []
   }
 ];
 
@@ -132,12 +142,14 @@ export const iface = new ethers.Interface(HOOK_ABI);
 const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 export const SEL_INIT_POOL = iface.getFunction("initializePool").selector.toLowerCase();
 export const SEL_ADD_OWNERS = iface.getFunction("addPoolOwners").selector.toLowerCase();
+export const SEL_SET_STARTED = iface.getFunction("setPoolStartedTimestamp").selector.toLowerCase();
 
-// 返回命中的方法名（initializePool / addPoolOwners）或 null
+// 返回命中的方法名（initializePool / addPoolOwners / setPoolStartedTimestamp）或 null
 export function matchedMethod(data) {
   const d = (data || "").toLowerCase();
   if (d.startsWith(SEL_INIT_POOL)) return "initializePool";
   if (d.startsWith(SEL_ADD_OWNERS)) return "addPoolOwners";
+  if (d.startsWith(SEL_SET_STARTED)) return "setPoolStartedTimestamp";
   return null;
 }
 

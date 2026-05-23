@@ -3,6 +3,7 @@ import { ethers } from "ethers";
 import {
   SEL_INIT_POOL,
   SEL_ADD_OWNERS,
+  SEL_SET_STARTED,
   matchedMethod,
   computePoolId,
   parseCLInitializeEvent,
@@ -36,12 +37,19 @@ describe("selectors", () => {
     );
     expect(SEL_ADD_OWNERS).toBe("0xfe7815ed");
   });
+  it("setPoolStartedTimestamp selector is derived from setPoolStartedTimestamp(bytes32,uint256)", () => {
+    expect(iface.getFunction("setPoolStartedTimestamp").format("sighash")).toBe(
+      "setPoolStartedTimestamp(bytes32,uint256)"
+    );
+    expect(SEL_SET_STARTED).toBe("0x70e2af29");
+  });
 });
 
 describe("matchedMethod", () => {
-  it("detects both methods and rejects others", () => {
+  it("detects all three methods and rejects others", () => {
     expect(matchedMethod(SEL_INIT_POOL + "00")).toBe("initializePool");
     expect(matchedMethod(SEL_ADD_OWNERS + "00")).toBe("addPoolOwners");
+    expect(matchedMethod(SEL_SET_STARTED + "00")).toBe("setPoolStartedTimestamp");
     expect(matchedMethod("0xdeadbeef")).toBe(null);
     expect(matchedMethod("")).toBe(null);
   });
