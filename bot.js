@@ -32,8 +32,10 @@ const {
   TARGET_CONTRACT = "0xb0bb171D333569CfD28a37F5c5DdDAAa90aD46af",
   FILTER_FROM = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E",
   START_BLOCK,
-  POLL_MS = "30000",
-  MAX_BLOCKS_PER_TICK = "40",
+  // BSC 现约 0.75s 出一个块（≈1.33 块/秒）。扫描上限 = MAX_BLOCKS_PER_TICK / (POLL_MS/1000)
+  // 必须明显高于出块速度，否则只会打平、永远清不掉积压。这里 100 块 / 10 秒 = 10 块/秒 ≈ 7.5 倍。
+  POLL_MS = "10000",
+  MAX_BLOCKS_PER_TICK = "100",
   // 扫块确认数，避免链重组：只扫已过 N 个确认的块
   CONFIRMATIONS = "3",
   TIMEZONE = "Asia/Shanghai",
@@ -93,6 +95,8 @@ let lastRpcLatencyMs = null;
 let lastAlert = null;
 let lastPush = { ok: 0, total: 0 };
 const recentAlerts = [];
+// /resync 请求的新游标；tick 在下一轮开始时消费，并中断当前正在进行的扫描
+let pendingResync = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -689,6 +693,7 @@ function buildHelpMessage() {
     `/subscribe - 让当前会话/群接收告警（白名单）`,
     `/unsubscribe - 取消当前会话/群的订阅（白名单）`,
     `/subscribers - 查看所有收件会话和白名单（白名单）`,
+    `/resync [区块号] - 重置扫描游标；不带参数=跳到链头恢复实时（白名单）`,
     ``,
     `💡 /import /pool /check 可不带参数发送，机器人会让你直接回复粘贴哈希 / poolId。`,
     `🔒 控制命令仅限白名单用户。其它人无法控制本机器人。`,
@@ -813,6 +818,35 @@ async function unsubscribeChat(chatId) {
   subscribers.delete(String(chatId));
   await saveSubscribers();
   return true;
+}
+
+// 重置扫描游标：不带参数=跳到链头（放弃积压，恢复实时）；带区块号=从该块开始扫。
+async function buildResync(arg) {
+  let head;
+  try {
+    const latestRaw = await withTimeout(provider.getBlockNumber(), rpcTimeoutMs, "getBlockNumber");
+    head = Math.max(0, latestRaw - confirmations);
+  } catch (err) {
+    return `❌ 读取最新区块失败，无法重置：<code>${escapeHtml(err?.message || err)}</code>`;
+  }
+  let target;
+  if (arg != null && String(arg).trim() !== "") {
+    const from = Number(arg);
+    if (!Number.isFinite(from) || from < 0)
+      return `用法：/resync（跳到链头）或 /resync &lt;区块号&gt;`;
+    target = Math.max(0, Math.floor(from) - 1); // 下一轮从 from 开始扫
+  } else {
+    target = head; // 跳到链头，只扫之后的新块
+  }
+  pendingResync = target;
+  await writeCursor(target);
+  const lag = head - target;
+  return [
+    `✅ 已重置扫描游标到 <code>${target}</code>（下一轮从 <code>${target + 1}</code> 开始扫）。`,
+    `当前链头(已确认): <code>${head}</code>，落后 <code>${lag}</code> 块。`,
+    lag <= 0 ? `已对齐链头，恢复实时告警。` : `将从该位置继续扫描。`,
+    `（最多约 ${Number(POLL_MS) / 1000} 秒后生效。）`
+  ].join("\n");
 }
 
 function buildLastAlerts(n) {
@@ -981,6 +1015,9 @@ async function handleUpdate(update) {
     case "/subscribers":
       if (await requireWhitelist()) await sendMessage(chatId, buildSubscribersList());
       break;
+    case "/resync":
+      if (await requireWhitelist()) await sendMessage(chatId, await buildResync(args[0]));
+      break;
     default:
       break;
   }
@@ -1036,7 +1073,8 @@ async function setupTelegram() {
       { command: "last", description: "查看最近的告警" },
       { command: "subscribe", description: "让当前会话/群接收告警" },
       { command: "unsubscribe", description: "取消当前会话/群的订阅" },
-      { command: "subscribers", description: "查看收件会话和白名单" }
+      { command: "subscribers", description: "查看收件会话和白名单" },
+      { command: "resync", description: "重置扫描游标(默认跳到链头,可加区块号)" }
     ]
   });
   console.log("whitelist:", whitelist.size ? [...whitelist].join(", ") : "（空，暂无人可控制）");
@@ -1096,6 +1134,13 @@ async function tick() {
   if (busy) return;
   busy = true;
   try {
+    // /resync 请求优先：先落盘新游标，本轮直接从新位置开始
+    if (pendingResync !== null) {
+      const c = pendingResync;
+      pendingResync = null;
+      await writeCursor(c);
+      console.log(`游标已重置为 ${c}`);
+    }
     const t0 = Date.now();
     const latestRaw = await withTimeout(provider.getBlockNumber(), rpcTimeoutMs, "getBlockNumber");
     lastRpcLatencyMs = Date.now() - t0;
@@ -1115,6 +1160,8 @@ async function tick() {
     if (latest <= cursor) return;
     const toBlock = Math.min(latest, cursor + Number(MAX_BLOCKS_PER_TICK));
     for (let n = cursor + 1; n <= toBlock; n++) {
+      // 扫块途中收到 /resync：放弃本轮剩余，下一轮从新游标开始（避免覆盖重置值）
+      if (pendingResync !== null) break;
       await scanBlock(n);
       await writeCursor(n);
     }
