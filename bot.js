@@ -30,7 +30,10 @@ const {
   RPC_URL,
   TG_BOT_TOKEN,
   TG_CHAT_ID = "",
-  TARGET_CONTRACT = "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f",
+  // 监听的合约（CLAlphaHook）的 To。留空 = 不限合约（只靠 FILTER_FROM 盯操作钱包，
+  // 钱包换合约也不会漏）。也可逗号分隔多个地址来限定范围。
+  TARGET_CONTRACT = "",
+  // 操作钱包：盯这个地址发起的建池/加管理员/设开盘调用。这是主过滤条件。
   FILTER_FROM = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E",
   START_BLOCK,
   // BSC 现约 0.75s 出一个块（≈1.33 块/秒）。扫描上限 = MAX_BLOCKS_PER_TICK / (POLL_MS/1000)
@@ -81,8 +84,29 @@ const rpcTimeoutMs = Number(RPC_TIMEOUT_MS) || 15000;
 const confirmations = Math.max(0, Number(CONFIRMATIONS) || 0);
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
-const targetContract = ethers.getAddress(TARGET_CONTRACT);
+// 限定的合约集合（小写）。空 = 不限合约。
+const targetContracts = new Set(
+  String(TARGET_CONTRACT)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((a) => ethers.getAddress(a).toLowerCase())
+);
 const filterFrom = FILTER_FROM?.trim() ? ethers.getAddress(FILTER_FROM.trim()) : "";
+// 示例 / 展示用的代表合约（仅用于 /preview 示例和链接兜底）
+const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f";
+
+// To 是否在监听范围内：未限定合约时恒为 true
+function isWatchedContract(to) {
+  if (targetContracts.size === 0) return true;
+  return targetContracts.has((to || "").toLowerCase());
+}
+
+if (!filterFrom && targetContracts.size === 0) {
+  console.warn(
+    "⚠️ FILTER_FROM 和 TARGET_CONTRACT 都为空：将匹配全网所有该方法调用，极可能误报。请至少设置其一。"
+  );
+}
 
 const tokenCache = new Map();
 // poolId(lowercase) -> poolInfo
@@ -286,9 +310,9 @@ function isTargetTx(tx) {
   const txTo = tx.to ? tx.to.toLowerCase() : "";
   const txFrom = tx.from ? tx.from.toLowerCase() : "";
   const data = (tx.input || tx.data || "").toLowerCase();
-  if (txTo !== targetContract.toLowerCase()) return false;
   if (!matchedMethod(data)) return false;
   if (filterFrom && txFrom !== filterFrom.toLowerCase()) return false;
+  if (!isWatchedContract(txTo)) return false;
   return true;
 }
 
@@ -309,7 +333,7 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt) {
   // 以 CLPoolManager 的 Initialize 事件为准；事件取不到再回退到 Hook 入参。
   // Hook 自己的 PoolStartedAtUpdated 事件提供真实 poolId（备用）和准确开始时间。
   const realInit = parseCLInitializeEvent(receipt?.logs, poolManager);
-  const hookStarted = parseHookPoolStartedEvent(receipt?.logs, targetContract);
+  const hookStarted = parseHookPoolStartedEvent(receipt?.logs, tx.to || SAMPLE_HOOK);
   const currency0 = realInit?.currency0 ?? inputCurrency0;
   const currency1 = realInit?.currency1 ?? inputCurrency1;
   const hooks = realInit?.hooks ?? inputHooks;
@@ -419,7 +443,7 @@ async function buildAddOwnersMessage(tx, blockNumber, parsed) {
     txHash: tx.hash,
     secondRow: [
       owners[0] ? { text: "👤 Owner", url: bscscanAddressUrl(owners[0]) } : null,
-      { text: "🧩 Hook 合约", url: bscscanAddressUrl(targetContract) }
+      { text: "🧩 Hook 合约", url: bscscanAddressUrl(tx.to || SAMPLE_HOOK) }
     ].filter(Boolean)
   });
 
@@ -464,7 +488,7 @@ async function buildPoolStartedMessage(tx, blockNumber, parsed) {
   const reply_markup = buildPoolKeyboard({
     poolId,
     txHash: tx.hash,
-    secondRow: [{ text: "🧩 Hook 合约", url: bscscanAddressUrl(targetContract) }]
+    secondRow: [{ text: "🧩 Hook 合约", url: bscscanAddressUrl(tx.to || SAMPLE_HOOK) }]
   });
 
   return { text: lines.join("\n") + communityFooter(), reply_markup, pair, poolId };
@@ -548,8 +572,8 @@ async function buildImportResult(txHash) {
     return { text: `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>` };
   }
   if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
-  if ((tx.to || "").toLowerCase() !== targetContract.toLowerCase()) {
-    return { text: `⚠️ 该交易的 To 不是目标合约，无法导入。` };
+  if (!isWatchedContract(tx.to)) {
+    return { text: `⚠️ 该交易的 To 不在监听的合约范围内，无法导入。` };
   }
   if (matchedMethod(tx.data) !== "initializePool") {
     return { text: `⚠️ 只能导入 initializePool 交易（该交易方法不匹配）。` };
@@ -582,8 +606,8 @@ async function buildPreviewSample() {
   const sampleKey = {
     currency0: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", // WBNB
     currency1: "0x55d398326f99059fF775485246999027B3197955", // USDT (BSC)
-    hooks: targetContract,
-    poolManager: targetContract,
+    hooks: SAMPLE_HOOK,
+    poolManager: SAMPLE_HOOK,
     fee: 2500,
     parameters: "0x" + "00".repeat(32)
   };
@@ -595,8 +619,8 @@ async function buildPreviewSample() {
   const parsed = iface.parseTransaction({ data, value: 0 });
   const sampleTx = {
     hash: "0x0000000000000000000000000000000000000000000000000000000000000000",
-    from: filterFrom || targetContract,
-    to: targetContract,
+    from: filterFrom || SAMPLE_HOOK,
+    to: SAMPLE_HOOK,
     data
   };
   const m = await buildAlertMessage(sampleTx, "（示例）", parsed, null);
@@ -614,8 +638,8 @@ async function buildPreviewForTx(txHash) {
     return { text: `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>` };
   }
   if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
-  if ((tx.to || "").toLowerCase() !== targetContract.toLowerCase()) {
-    return { text: `⚠️ 该交易的 To 不是目标合约，无法预览。` };
+  if (!isWatchedContract(tx.to)) {
+    return { text: `⚠️ 该交易的 To 不在监听的合约范围内，无法预览。` };
   }
   const method = matchedMethod(tx.data);
   if (!method) {
@@ -653,10 +677,9 @@ async function buildHitCheck(txHash) {
   }
   if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
 
-  const txTo = (tx.to || "").toLowerCase();
   const txFrom = (tx.from || "").toLowerCase();
   const method = matchedMethod(tx.data);
-  const toMatch = txTo === targetContract.toLowerCase();
+  const toMatch = isWatchedContract(tx.to);
   const fromMatch = !filterFrom || txFrom === filterFrom.toLowerCase();
 
   let statusOk = null;
@@ -675,7 +698,13 @@ async function buildHitCheck(txHash) {
     `🔎 <b>命中检查</b>`,
     `<b>Tx:</b> <a href="https://bscscan.com/tx/${tx.hash}">${shortAddr(tx.hash)}</a>`,
     ``,
-    `${yn(toMatch)} <b>To 目标合约:</b> ${toMatch ? "匹配" : `不匹配（实际 ${shortAddr(tx.to || "无")}）`}`,
+    `${yn(toMatch)} <b>To 合约:</b> ${
+      targetContracts.size === 0
+        ? `不限合约（实际 ${shortAddr(tx.to || "无")}）`
+        : toMatch
+          ? "在范围内"
+          : `不在范围内（实际 ${shortAddr(tx.to || "无")}）`
+    }`,
     `${yn(!!method)} <b>方法:</b> ${method ? `${method}` : "不是已监听的方法"}`,
     filterFrom
       ? `${yn(fromMatch)} <b>From 过滤:</b> ${fromMatch ? "通过" : `被过滤（实际 ${shortAddr(tx.from)}，需要 ${shortAddr(filterFrom)}）`}`
@@ -724,8 +753,10 @@ function buildHelpMessage() {
   return [
     `🤖 <b>BSC Initialize Pool / Add Pool Owners 监听机器人</b>`,
     ``,
-    `监听合约 <code>${shortAddr(targetContract)}</code> 上的 <code>initializePool</code>、<code>addPoolOwners</code> 与 <code>setPoolStartedTimestamp</code>，`,
-    `命中后推送新池 / 加管理员信息，并附 PancakeSwap 链接与按钮。`,
+    `盯操作钱包 <code>${filterFrom ? shortAddr(filterFrom) : "未设置"}</code> 的 <code>initializePool</code>、<code>addPoolOwners</code> 与 <code>setPoolStartedTimestamp</code> 调用${
+      targetContracts.size ? `（限 ${targetContracts.size} 个合约）` : "（不限合约）"
+    }，`,
+    `命中后推送新池 / 加管理员 / 开盘时间信息，并附 PancakeSwap 链接与按钮。`,
     ``,
     `<b>命令</b>`,
     `/help - 显示本帮助`,
@@ -774,8 +805,12 @@ async function buildStatusMessage() {
     ``,
     `<b>运行时长:</b> ${formatUptime(Date.now() - startedAt)}`,
     `<b>链:</b> chainId <code>${chainId}</code>${chainId === "56" ? " (BSC)" : ""}`,
-    `<b>监听合约:</b> <code>${targetContract}</code>`,
-    `<b>From 过滤:</b> ${filterFrom ? `<code>${filterFrom}</code>` : "未限制"}`,
+    `<b>监听钱包(From):</b> ${filterFrom ? `<code>${filterFrom}</code>` : "未设置 ⚠️"}`,
+    `<b>监听合约:</b> ${
+      targetContracts.size === 0
+        ? "不限（任意合约）"
+        : [...targetContracts].map((a) => `<code>${a}</code>`).join("、")
+    }`,
     `<b>监听方法:</b> initializePool <code>${SEL_INIT_POOL}</code> / addPoolOwners <code>${SEL_ADD_OWNERS}</code> / setPoolStartedTimestamp <code>${SEL_SET_STARTED}</code>`,
     ``,
     `<b>最新区块:</b> <code>${latestRaw}</code>`,
@@ -1234,7 +1269,10 @@ async function main() {
   const network = await provider.getNetwork();
   console.log("BSC Initialize Pool / Add Pool Owners TG Bot started");
   console.log("chainId:", network.chainId.toString());
-  console.log("targetContract:", targetContract);
+  console.log(
+    "targetContracts:",
+    targetContracts.size === 0 ? "(any)" : [...targetContracts].join(", ")
+  );
   console.log("filterFrom:", filterFrom || "未限制 From，监听所有调用者");
   console.log("selectors:", {
     initializePool: SEL_INIT_POOL,
