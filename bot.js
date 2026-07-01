@@ -38,13 +38,17 @@ const {
   START_BLOCK,
   // 每隔 POLL_MS 毫秒轮询一次数据源，查目标地址的交易（不再逐块拉 RPC）
   POLL_MS = "10000",
-  // 数据源：查目标地址交易，取代逐块 eth_getBlockByNumber，大幅降低 RPC 消耗。
-  //   DATA_SOURCE=rpc      → 逐块拉 eth_getBlockByNumber（在免费/自建 RPC 上零成本，最省心）
-  //   DATA_SOURCE=ankr     → Ankr Advanced API（需该 Key 开通 Advanced API 权限）
+  // 数据源：怎么发现目标地址的交易，取代逐块 eth_getBlockByNumber。
+  //   DATA_SOURCE=nodereal  → NodeReal 免费索引 API 列出钱包交易，再用 RPC 补全（推荐，BSC 免费额度内）
+  //   DATA_SOURCE=rpc       → 逐块拉 eth_getBlockByNumber（免费/自建 RPC 零成本，无需 Key）
+  //   DATA_SOURCE=ankr      → Ankr Advanced API（需该 Key 开通 Advanced API 权限）
   //   DATA_SOURCE=etherscan → Etherscan V2 txlist（需付费计划才含 BSC）
-  DATA_SOURCE = "rpc",
+  DATA_SOURCE = "nodereal",
   // 仅 DATA_SOURCE=rpc：逐块模式单轮最多扫多少块
   RPC_MAX_BLOCKS_PER_TICK = "200",
+  // 仅 DATA_SOURCE=nodereal：MegaNode 端点 + 免费 API Key（https://nodereal.io 注册获取）
+  NODEREAL_API = "https://bsc-mainnet.nodereal.io/v1",
+  NODEREAL_API_KEY = "",
   // —— Ankr Advanced API（DATA_SOURCE=ankr 时用）——
   // ANKR_API_KEY 留空则自动从 RPC_URL（形如 https://rpc.ankr.com/bsc/<KEY>）里提取。
   ANKR_ADVANCED_API = "https://rpc.ankr.com/multichain",
@@ -110,11 +114,15 @@ const filterFrom = FILTER_FROM?.trim() ? ethers.getAddress(FILTER_FROM.trim()) :
 // 示例 / 展示用的代表合约（仅用于 /preview 示例和链接兜底）
 const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f";
 
-// 数据源配置：rpc（逐块扫描，免费/自建 RPC 零成本）| ankr（Advanced API）| etherscan（V2 txlist）
+// 数据源：nodereal（免费索引 API，推荐）| rpc（逐块扫描）| ankr（Advanced API）| etherscan（V2 txlist）
 const _ds = String(DATA_SOURCE).trim().toLowerCase();
-const dataSource = _ds === "etherscan" ? "etherscan" : _ds === "rpc" ? "rpc" : "ankr";
+const dataSource = ["rpc", "ankr", "etherscan", "nodereal"].includes(_ds) ? _ds : "nodereal";
 // 逐块模式单轮最多扫多少块（须高于出块速度以清积压；BSC 约 13 块/10 秒）
 const rpcMaxBlocksPerTick = Math.max(1, Number(RPC_MAX_BLOCKS_PER_TICK) || 200);
+
+// NodeReal MegaNode Enhanced API（nr_getTransactionByAddress）
+const noderealApi = String(NODEREAL_API).trim().replace(/\/+$/, "");
+const noderealKey = String(NODEREAL_API_KEY).trim();
 
 // Etherscan V2 / BscScan
 const explorerApi = String(EXPLORER_API).trim();
@@ -133,14 +141,21 @@ const ankrKey =
   (String(RPC_URL).match(/rpc\.ankr\.com\/[^/]+\/([A-Za-z0-9]+)/)?.[1] ?? "");
 
 // 数据源显示名 & 是否缺 Key（供 /status 与启动日志）
-const dataSourceLabel =
-  dataSource === "ankr"
-    ? "Ankr Advanced API"
-    : dataSource === "etherscan"
-      ? explorerHost
-      : "RPC 逐块扫描";
+const DATA_SOURCE_LABELS = {
+  nodereal: "NodeReal Enhanced API",
+  ankr: "Ankr Advanced API",
+  etherscan: explorerHost,
+  rpc: "RPC 逐块扫描"
+};
+const dataSourceLabel = DATA_SOURCE_LABELS[dataSource];
 const dataSourceKeyMissing =
-  dataSource === "ankr" ? !ankrKey : dataSource === "etherscan" ? !explorerKey : false;
+  dataSource === "nodereal"
+    ? !noderealKey
+    : dataSource === "ankr"
+      ? !ankrKey
+      : dataSource === "etherscan"
+        ? !explorerKey
+        : false;
 
 // 轮询交易的地址：优先盯操作钱包(From)；未设钱包则退回盯目标合约。
 const watchAddresses = filterFrom ? [filterFrom] : [...targetContracts];
@@ -154,6 +169,11 @@ function isWatchedContract(to) {
 if (!filterFrom && targetContracts.size === 0) {
   console.warn(
     "⚠️ FILTER_FROM 和 TARGET_CONTRACT 都为空：没有可轮询的地址，将收不到任何告警。请至少设置其一。"
+  );
+}
+if (dataSource === "nodereal" && !noderealKey) {
+  console.warn(
+    "⚠️ DATA_SOURCE=nodereal 但没有 NODEREAL_API_KEY：请去 https://nodereal.io 免费注册获取并填入。"
   );
 }
 if (dataSource === "ankr" && !ankrKey) {
@@ -1298,8 +1318,60 @@ async function ankrTxList(address, startBlock, endBlock) {
   return txs;
 }
 
+// 用 NodeReal Enhanced API 列出某地址在 [startBlock, endBlock] 的“对外发起”交易（含 0 值合约调用），
+// 再用 RPC 逐笔补全 input（NodeReal 列表不含 calldata），返回带 input 的完整交易对象。
+async function noderealTxList(address, startBlock, endBlock) {
+  const hashes = [];
+  const seen = new Set();
+  let pageKey = "";
+  for (let i = 0; i < 50; i++) {
+    const p = {
+      category: ["external"],
+      addressType: "from",
+      address,
+      order: "asc",
+      excludeZeroValue: false,
+      maxCount: "0x3e8", // 1000
+      fromBlock: ethers.toQuantity(startBlock),
+      toBlock: ethers.toQuantity(endBlock)
+    };
+    if (pageKey) p.pageKey = pageKey;
+    const res = await fetch(`${noderealApi}/${noderealKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: 1, jsonrpc: "2.0", method: "nr_getTransactionByAddress", params: [p] }),
+      signal: AbortSignal.timeout(rpcTimeoutMs)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.error) {
+      throw new Error(`NodeReal 异常：${data.error.message || JSON.stringify(data.error)}`);
+    }
+    const result = data.result || {};
+    const transfers = Array.isArray(result.transfers) ? result.transfers : [];
+    for (const t of transfers) {
+      if (t.receiptsStatus !== 1) continue; // 跳过失败交易
+      if (targetContracts.size && !targetContracts.has((t.to || "").toLowerCase())) continue;
+      if (t.hash && !seen.has(t.hash)) {
+        seen.add(t.hash);
+        hashes.push(t.hash);
+      }
+    }
+    pageKey = result.pageKey || "";
+    // maxCount=1000，返回不足 1000 即为最后一页；pageKey 为空也结束
+    if (transfers.length < 1000 || !pageKey) break;
+  }
+  // 用 RPC 补全 input（命中判定需要 calldata）
+  const txs = [];
+  for (const hash of hashes) {
+    const tx = await withTimeout(provider.getTransaction(hash), rpcTimeoutMs, "getTransaction");
+    if (tx) txs.push(tx);
+  }
+  return txs;
+}
+
 // 按当前 DATA_SOURCE 查某地址的交易
 async function sourceTxList(address, startBlock, endBlock) {
+  if (dataSource === "nodereal") return noderealTxList(address, startBlock, endBlock);
   if (dataSource === "etherscan") return explorerTxList(address, startBlock, endBlock);
   return ankrTxList(address, startBlock, endBlock);
 }

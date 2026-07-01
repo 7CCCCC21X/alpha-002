@@ -5,7 +5,7 @@
 并默认只推送由 `0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E` 发起的交易（可关闭）。
 
 - 监听的是**已确认区块**（可配置确认数），稳定性比 pending/mempool 高。
-- **数据源可切换**（`DATA_SOURCE`）：`rpc` 逐块扫描（默认，配免费公共 RPC 零成本、无需 Key）、`ankr` Advanced API（省 RPC，需开通权限）、`etherscan`（付费才含 BSC）。
+- **数据源可切换**（`DATA_SOURCE`）：`nodereal` 免费索引 API（默认，推荐）、`rpc` 逐块扫描（免费公共 RPC 零成本、无需 Key）、`ankr` Advanced API（需开通权限）、`etherscan`（付费才含 BSC）。
 - 自带 Telegram 命令菜单、白名单权限控制，可拉进群使用。
 - 每个 poolId 都附 PancakeSwap 池子链接和内联按钮；`/pool` 还能读链上**当前价格**。
 - 池子信息持久化到 `pools.json`，重启后历史池子仍能显示币对。
@@ -122,8 +122,10 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `FILTER_FROM` | | `0xb55eDCBE…CD9E` | 只推这个地址发起的调用；留空 = 监听所有调用者 |
 | `START_BLOCK` | | 空 | 首次启动从哪个区块开始扫；留空则从最新块开始，不推历史 |
 | `POLL_MS` | | `10000` | 每隔多少毫秒查一次数据源（默认 10 秒） |
-| `DATA_SOURCE` | | `rpc` | 数据源：`rpc`（逐块扫描，配免费公共 RPC 即零成本，无需 Key，**最省心**）／`ankr`（Ankr Advanced API，需该 Key 开通 Advanced API 权限）／`etherscan`（Etherscan V2，免费版**不含 BSC**，需付费） |
-| `RPC_MAX_BLOCKS_PER_TICK` | | `200` | 仅 `DATA_SOURCE=rpc`：逐块模式单轮最多扫多少块 |
+| `DATA_SOURCE` | | `nodereal` | 数据源：`nodereal`（NodeReal 免费索引 API，**推荐**）／`rpc`（逐块扫描，配免费公共 RPC 零成本、无需 Key）／`ankr`（需该 Key 开通 Advanced API 权限）／`etherscan`（免费版**不含 BSC**，需付费） |
+| `NODEREAL_API_KEY` | | 空 | 仅 `nodereal`：去 [nodereal.io](https://nodereal.io) 免费注册获取 |
+| `NODEREAL_API` | | `https://bsc-mainnet.nodereal.io/v1` | 仅 `nodereal`：MegaNode 端点 |
+| `RPC_MAX_BLOCKS_PER_TICK` | | `200` | 仅 `rpc`：逐块模式单轮最多扫多少块 |
 | `ANKR_API_KEY` | | 空 | 仅 `ankr`：Ankr API Key；留空则自动从 `RPC_URL` 提取 |
 | `ANKR_ADVANCED_API` / `ANKR_BLOCKCHAIN` | | `…/multichain` `bsc` | 仅 `ankr` |
 | `EXPLORER_API` / `EXPLORER_API_KEY` / `EXPLORER_CHAIN_ID` | | Etherscan V2 | 仅 `etherscan` |
@@ -167,8 +169,10 @@ npm run format # prettier
 再按 `DATA_SOURCE` 发现监听地址（`FILTER_FROM`，未设则退回 `TARGET_CONTRACT`）在 `(上次游标, 确认后区块]`
 区间内的交易：
 
-- **`rpc`（默认）**：逐块 `eth_getBlockByNumber` 取全部交易。**无需任何 API Key**，配免费公共 RPC 即零成本，
-  最省心；缺点是链上调用较多，跑在付费计量端点上会较贵。
+- **`nodereal`（默认）**：用 NodeReal 免费索引 API `nr_getTransactionByAddress` 列出监听钱包的对外交易
+  （含 0 值合约调用），再用 RPC 逐笔补全 calldata + 查回执。只按“钱包活跃度”消耗，几乎全在免费额度内。
+- **`rpc`**：逐块 `eth_getBlockByNumber` 取全部交易。**无需任何 API Key**，配免费公共 RPC 即零成本；
+  缺点是链上调用较多，跑在付费计量端点上会较贵。
 - **`ankr`**：Ankr Advanced API `ankr_getTransactionsByAddress`，一次调用覆盖整个区间，RPC 用量极低；
   但该 Key 需开通 Advanced API 权限，否则报 `-32052/403`。
 - **`etherscan`**：Etherscan V2 `account/txlist`。⚠️ 免费版**已不支持 BSC 等链**（报 “Free API access is
