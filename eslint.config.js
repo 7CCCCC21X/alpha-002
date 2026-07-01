@@ -10,6 +10,8 @@ export default [
         process: "readonly",
         console: "readonly",
         fetch: "readonly",
+        URL: "readonly",
+        URLSearchParams: "readonly",
         setTimeout: "readonly",
         clearTimeout: "readonly",
         setInterval: "readonly",

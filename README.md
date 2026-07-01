@@ -4,7 +4,8 @@
 默认监听 PancakeSwap Infinity 的 `CLAlphaHook` 合约 `0xb0bb171D333569CfD28a37F5c5DdDAAa90aD46af`，
 并默认只推送由 `0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E` 发起的交易（可关闭）。
 
-- 监听的是**已确认区块**（轮询扫块 + 可配置确认数），稳定性比 pending/mempool 高。
+- 监听的是**已确认区块**（可配置确认数），稳定性比 pending/mempool 高。
+- **省 RPC**：用区块浏览器 API（Etherscan V2 / BscScan）轮询目标钱包的交易，替代逐块拉 `eth_getBlockByNumber`；RPC 只在命中告警时查回执/代币信息才用到，日常消耗几乎为零。
 - 自带 Telegram 命令菜单、白名单权限控制，可拉进群使用。
 - 每个 poolId 都附 PancakeSwap 池子链接和内联按钮；`/pool` 还能读链上**当前价格**。
 - 池子信息持久化到 `pools.json`，重启后历史池子仍能显示币对。
@@ -120,10 +121,12 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `TARGET_CONTRACT` | | `0xb0bb171D…46af` | 监听的合约，也就是交易里的 To |
 | `FILTER_FROM` | | `0xb55eDCBE…CD9E` | 只推这个地址发起的调用；留空 = 监听所有调用者 |
 | `START_BLOCK` | | 空 | 首次启动从哪个区块开始扫；留空则从最新块开始，不推历史 |
-| `POLL_MS` | | `30000` | 每隔多少毫秒检查一次新区块（默认 30 秒） |
-| `MAX_BLOCKS_PER_TICK` | | `40` | 单次最多扫多少块，防积压 |
-| `CONFIRMATIONS` | | `3` | 扫块确认数，避免链重组；只扫 `latest - N` 之前的块 |
-| `RPC_TIMEOUT_MS` | | `15000` | 单次 RPC 调用超时（毫秒） |
+| `POLL_MS` | | `10000` | 每隔多少毫秒查一次区块浏览器 API（默认 10 秒） |
+| `EXPLORER_API` | | `https://api.etherscan.io/v2/api` | 区块浏览器接口（Etherscan V2 多链，兼容 BscScan）；数据源，替代逐块拉 RPC |
+| `EXPLORER_API_KEY` | | 空 | Etherscan/BscScan 免费 API Key；强烈建议填，否则限速很低 |
+| `EXPLORER_CHAIN_ID` | | `56` | 链 ID，BSC 主网 = 56 |
+| `CONFIRMATIONS` | | `3` | 确认数，避免链重组；只处理 `latest - N` 之前的块 |
+| `RPC_TIMEOUT_MS` | | `15000` | 单次 RPC / 浏览器 API 调用超时（毫秒） |
 | `COMMUNITY_NAME` | | `小C聊天群` | 消息结尾引流的群名（可点击的文字） |
 | `COMMUNITY_URL` | | `https://t.me/xiaoc236` | 群名指向的链接；留空则不显示页脚 |
 | `TIMEZONE` | | `Asia/Shanghai` | 开始时间显示时区（Asia/Shanghai=北京、Asia/Taipei=台北），会带 UTC 偏移 |
@@ -158,20 +161,23 @@ npm run format # prettier
 
 ## 工作原理
 
-每隔 `POLL_MS` 毫秒，机器人读取最新区块号，减去 `CONFIRMATIONS` 得到确认后区块，从上次游标位置逐块向前扫描
-（单次最多 `MAX_BLOCKS_PER_TICK` 块）。对每个区块，取出全部交易，筛出 `To == TARGET_CONTRACT` 且方法选择器命中、
-且通过 `FILTER_FROM` 过滤的交易，确认 receipt 状态成功后解析参数并推送到 Telegram。
+每隔 `POLL_MS` 毫秒，机器人用一次 `eth_blockNumber` 读取最新区块号，减去 `CONFIRMATIONS` 得到确认后区块，
+然后调用区块浏览器 API（`EXPLORER_API`）的 `account/txlist`，一次性拉取监听地址（`FILTER_FROM`，未设则退回
+`TARGET_CONTRACT`）在 `(上次游标, 确认后区块]` 区间内的全部交易——**不再逐块拉 RPC**。筛出方法选择器命中、
+且通过 `FILTER_FROM` / `TARGET_CONTRACT` 过滤的交易，确认 receipt 状态成功后解析参数并推送到 Telegram。
 
-- **不漏告警**：某块的告警若所有会话都推送失败（含重试），会抛错使该块游标不前进，下一轮重试。
-- **不重复 / 不漏块**：成功后才把游标写入 `CURSOR_FILE`。
-- **RPC 健壮**：所有链上调用都包了超时（`RPC_TIMEOUT_MS`），避免单个请求卡死。
+- **省 RPC**：日常只有 1 次 `eth_blockNumber` + 1 次浏览器 API 调用；`eth_getTransactionReceipt` / 代币元数据
+  只在真正命中告警时才查（目标钱包动作很少）。相比逐块 `eth_getBlockByNumber`，RPC 用量下降约两个数量级。
+- **不漏告警**：命中交易若所有会话都推送失败（含重试），会抛错使游标停在该块之前，下一轮重试。
+- **不重复 / 不漏块**：处理完成后才把游标写入 `CURSOR_FILE`；浏览器 API 拉取失败则本轮不前进游标。
+- **健壮**：所有链上 / API 调用都包了超时（`RPC_TIMEOUT_MS`），避免单个请求卡死。
 
 > 想抢跑监听“未确认 pending 交易”需要换成支持 BSC pending tx 的 WebSocket RPC，很多公共 BSC RPC 不开放完整 pending 流。
 
 ## 项目结构
 
 ```
-bot.js            入口：扫块、游标、Telegram 推送、命令、持久化
+bot.js            入口：浏览器 API 轮询、游标、Telegram 推送、命令、持久化
 src/core.js       纯函数：ABI/选择器、poolId 计算、价格换算、URL/按钮、格式化（有单元测试）
 test/core.test.js core.js 的单元测试（vitest）
 railway.json      Railway 部署配置

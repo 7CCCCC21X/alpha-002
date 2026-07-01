@@ -36,11 +36,14 @@ const {
   // 操作钱包：盯这个地址发起的建池/加管理员/设开盘调用。这是主过滤条件。
   FILTER_FROM = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E",
   START_BLOCK,
-  // BSC 现约 0.75s 出一个块（≈1.33 块/秒）。扫描上限 = MAX_BLOCKS_PER_TICK / (POLL_MS/1000)
-  // 必须明显高于出块速度，否则只会打平、永远清不掉积压。这里 100 块 / 10 秒 = 10 块/秒 ≈ 7.5 倍。
+  // 每隔 POLL_MS 毫秒轮询一次区块浏览器 API（不再逐块拉 RPC）
   POLL_MS = "10000",
-  MAX_BLOCKS_PER_TICK = "100",
-  // 扫块确认数，避免链重组：只扫已过 N 个确认的块
+  // 数据源：区块浏览器 API（Etherscan V2 多链 / BscScan 兼容），查目标地址交易，
+  // 取代逐块 eth_getBlockByNumber，大幅降低 RPC 消耗。
+  EXPLORER_API = "https://api.etherscan.io/v2/api",
+  EXPLORER_API_KEY = "",
+  EXPLORER_CHAIN_ID = "56",
+  // 确认数，避免链重组：只处理已过 N 个确认的块
   CONFIRMATIONS = "3",
   TIMEZONE = "Asia/Shanghai",
   // Railway 文件系统是临时的，重启会丢失。想持久化，挂 Volume 后把这几个指向挂载点。
@@ -96,6 +99,17 @@ const filterFrom = FILTER_FROM?.trim() ? ethers.getAddress(FILTER_FROM.trim()) :
 // 示例 / 展示用的代表合约（仅用于 /preview 示例和链接兜底）
 const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f";
 
+// 数据源配置：区块浏览器 API
+const explorerApi = String(EXPLORER_API).trim();
+const explorerKey = String(EXPLORER_API_KEY).trim();
+const explorerChainId = String(EXPLORER_CHAIN_ID).trim() || "56";
+let explorerHost = explorerApi;
+try {
+  explorerHost = new URL(explorerApi).host;
+} catch {}
+// 轮询交易的地址：优先盯操作钱包(From)；未设钱包则退回盯目标合约。
+const watchAddresses = filterFrom ? [filterFrom] : [...targetContracts];
+
 // To 是否在监听范围内：未限定合约时恒为 true
 function isWatchedContract(to) {
   if (targetContracts.size === 0) return true;
@@ -104,7 +118,12 @@ function isWatchedContract(to) {
 
 if (!filterFrom && targetContracts.size === 0) {
   console.warn(
-    "⚠️ FILTER_FROM 和 TARGET_CONTRACT 都为空：将匹配全网所有该方法调用，极可能误报。请至少设置其一。"
+    "⚠️ FILTER_FROM 和 TARGET_CONTRACT 都为空：没有可轮询的地址，将收不到任何告警。请至少设置其一。"
+  );
+}
+if (!explorerKey) {
+  console.warn(
+    "⚠️ 未设置 EXPLORER_API_KEY：Etherscan/BscScan 无 Key 限速很低，建议申请免费 Key 填入。"
   );
 }
 
@@ -117,6 +136,8 @@ const startedAt = Date.now();
 let botUsername = "";
 let botId = 0;
 let lastRpcLatencyMs = null;
+let lastExplorerLatencyMs = null;
+let lastExplorerError = null;
 let lastAlert = null;
 let lastPush = { ok: 0, total: 0 };
 const recentAlerts = [];
@@ -818,6 +839,10 @@ async function buildStatusMessage() {
     `<b>已扫描到:</b> <code>${cursor ?? "未初始化"}</code>`,
     `<b>落后:</b> <code>${lag}</code> 块`,
     `<b>检查间隔:</b> <code>${Number(POLL_MS) / 1000}</code> 秒`,
+    `<b>数据源:</b> <code>${escapeHtml(explorerHost)}</code>${explorerKey ? "" : " ⚠️无Key"}`,
+    `<b>浏览器延迟:</b> <code>${lastExplorerLatencyMs ?? "?"}</code> ms${
+      lastExplorerError ? `｜⚠️ ${escapeHtml(lastExplorerError)}` : ""
+    }`,
     `<b>RPC 延迟:</b> <code>${lastRpcLatencyMs ?? "?"}</code> ms`,
     ``,
     `<b>缓存:</b> Pools <code>${poolCache.size}</code> / Tokens <code>${tokenCache.size}</code>`,
@@ -1170,53 +1195,92 @@ async function setupTelegram() {
   console.log("whitelist:", whitelist.size ? [...whitelist].join(", ") : "（空，暂无人可控制）");
 }
 
-// ---------------- 扫块 ----------------
+// ---------------- 拉取 & 处理 ----------------
 
-async function scanBlock(blockNumber) {
-  const block = await withTimeout(
-    provider.send("eth_getBlockByNumber", [ethers.toQuantity(blockNumber), true]),
-    rpcTimeoutMs,
-    "eth_getBlockByNumber"
-  );
-  if (!block || !Array.isArray(block.transactions)) return;
-  for (const tx of block.transactions) {
-    if (!isTargetTx(tx)) continue;
-    const receipt = await withTimeout(
-      provider.getTransactionReceipt(tx.hash),
-      rpcTimeoutMs,
-      "getTransactionReceipt"
-    );
-    if (!receipt || receipt.status !== 1) {
-      console.log("命中但交易失败或 receipt 未就绪:", tx.hash);
-      continue;
+// 从区块浏览器查某地址在 [startBlock, endBlock] 的交易（Etherscan V2 / BscScan 兼容）
+async function explorerTxList(address, startBlock, endBlock) {
+  const qs = new URLSearchParams({
+    chainid: explorerChainId,
+    module: "account",
+    action: "txlist",
+    address,
+    startblock: String(startBlock),
+    endblock: String(endBlock),
+    page: "1",
+    offset: "10000",
+    sort: "asc"
+  });
+  if (explorerKey) qs.set("apikey", explorerKey);
+  const res = await fetch(`${explorerApi}?${qs.toString()}`, {
+    signal: AbortSignal.timeout(rpcTimeoutMs)
+  });
+  const data = await res.json().catch(() => ({}));
+  // status "1"=有结果；"0"+“No transactions found”=空区间；其它=报错（含限速）
+  if (data.status === "1" && Array.isArray(data.result)) return data.result;
+  if (data.status === "0" && /no transactions found/i.test(data.message || "")) return [];
+  const detail = typeof data.result === "string" ? data.result : data.message || "未知错误";
+  throw new Error(`浏览器 API 异常：${detail}`);
+}
+
+// 拉取所有监听地址在 (fromBlock, toBlock] 的候选交易，按 hash 去重
+async function fetchCandidateTxs(fromBlock, toBlock) {
+  const t0 = Date.now();
+  const seen = new Set();
+  const all = [];
+  for (const addr of watchAddresses) {
+    const rows = await explorerTxList(addr, fromBlock, toBlock);
+    for (const r of rows) {
+      if (r?.hash && !seen.has(r.hash)) {
+        seen.add(r.hash);
+        all.push(r);
+      }
     }
-    const method = matchedMethod(tx.input || tx.data);
-    let built;
-    try {
-      const parsed = iface.parseTransaction({ data: tx.input || tx.data, value: tx.value ?? 0 });
-      built = await buildMessageForMethod(method, tx, blockNumber, parsed, receipt);
-    } catch (err) {
-      console.error(`解析 ${method} 失败:`, tx.hash, err);
-      continue;
+    if (rows.length >= 10000) {
+      console.warn(`⚠️ ${addr} 在 ${fromBlock}-${toBlock} 命中单页上限(10000)，可能需缩小区间。`);
     }
-    // initializePool 记住消息 id；addPoolOwners 回复对应的初始化消息
-    const sendOptions =
-      method === "initializePool"
-        ? { poolId: built.poolId, rememberPoolMessage: true }
-        : { poolId: built.poolId, replyToPoolMessage: true };
-    const okCount = await sendTelegram(
-      built.text,
-      built.reply_markup ? { reply_markup: built.reply_markup } : {},
-      sendOptions
-    );
-    if (okCount === 0) {
-      // 全部会话推送失败：抛错，让本块游标不前进，下一轮重试，避免漏告警
-      throw new Error(`Telegram 推送失败，tx=${tx.hash}`);
-    }
-    recordAlert({ method, txHash: tx.hash, pair: built.pair, blockNumber });
-    if (built.poolInfo) await savePoolInfo(built.poolInfo);
-    console.log(`[ALERT] method=${method} block=${blockNumber} tx=${tx.hash}`);
   }
+  lastExplorerLatencyMs = Date.now() - t0;
+  return all;
+}
+
+// 处理一笔已命中的交易：查回执确认成功后构造并推送告警
+async function processMatchedTx(tx) {
+  const blockNumber = Number(tx.blockNumber);
+  // initializePool 的准确 poolId 依赖回执里的 Initialize 事件，故命中后仍需一次回执查询；
+  // 命中很少（仅目标钱包动作），RPC 消耗可忽略。
+  const receipt = await withTimeout(
+    provider.getTransactionReceipt(tx.hash),
+    rpcTimeoutMs,
+    "getTransactionReceipt"
+  );
+  if (!receipt || receipt.status !== 1) {
+    console.log("命中但交易失败或 receipt 未就绪:", tx.hash);
+    return;
+  }
+  const method = matchedMethod(tx.input || tx.data);
+  let built;
+  try {
+    const parsed = iface.parseTransaction({ data: tx.input || tx.data, value: tx.value ?? 0 });
+    built = await buildMessageForMethod(method, tx, blockNumber, parsed, receipt);
+  } catch (err) {
+    console.error(`解析 ${method} 失败:`, tx.hash, err);
+    return;
+  }
+  // initializePool 记住消息 id；addPoolOwners 回复对应的初始化消息
+  const sendOptions =
+    method === "initializePool"
+      ? { poolId: built.poolId, rememberPoolMessage: true }
+      : { poolId: built.poolId, replyToPoolMessage: true };
+  const okCount = await sendTelegram(
+    built.text,
+    built.reply_markup ? { reply_markup: built.reply_markup } : {},
+    sendOptions
+  );
+  // 全部会话推送失败：抛错，让游标不前进，下一轮重试，避免漏告警
+  if (okCount === 0) throw new Error(`Telegram 推送失败，tx=${tx.hash}`);
+  recordAlert({ method, txHash: tx.hash, pair: built.pair, blockNumber });
+  if (built.poolInfo) await savePoolInfo(built.poolInfo);
+  console.log(`[ALERT] method=${method} block=${blockNumber} tx=${tx.hash}`);
 }
 
 let busy = false;
@@ -1248,14 +1312,40 @@ async function tick() {
       return;
     }
     if (latest <= cursor) return;
-    const toBlock = Math.min(latest, cursor + Number(MAX_BLOCKS_PER_TICK));
-    for (let n = cursor + 1; n <= toBlock; n++) {
-      // 扫块途中收到 /resync：放弃本轮剩余，下一轮从新游标开始（避免覆盖重置值）
-      if (pendingResync !== null) break;
-      await scanBlock(n);
-      await writeCursor(n);
+
+    // 一次调用覆盖整个区间 (cursor, latest]，不再逐块拉 RPC
+    let candidates;
+    try {
+      candidates = await fetchCandidateTxs(cursor + 1, latest);
+      lastExplorerError = null;
+    } catch (err) {
+      lastExplorerError = err?.message || String(err);
+      console.error("浏览器 API 拉取失败，本轮游标不前进:", lastExplorerError);
+      return;
     }
-    if (toBlock < latest) console.log(`还有区块积压: cursor=${toBlock}, latest=${latest}`);
+
+    // 命中过滤 + 按区块升序（保证 initializePool 先于同池 addPoolOwners，回复关系不乱）
+    const matches = candidates
+      .filter(isTargetTx)
+      .sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
+
+    let processedThrough = latest; // 默认推进到已确认链头
+    for (const tx of matches) {
+      // 处理途中收到 /resync：放弃本轮剩余，游标交由下一轮的重置值接管
+      if (pendingResync !== null) {
+        processedThrough = Number(tx.blockNumber) - 1;
+        break;
+      }
+      try {
+        await processMatchedTx(tx);
+      } catch (err) {
+        // 推送失败：游标停在该块之前，下一轮重试，避免漏告警
+        console.error("处理命中交易失败，游标不前进:", err?.message || err);
+        processedThrough = Number(tx.blockNumber) - 1;
+        break;
+      }
+    }
+    await writeCursor(processedThrough);
   } catch (err) {
     console.error("tick 错误:", err?.message || err);
   } finally {
@@ -1281,6 +1371,8 @@ async function main() {
   });
   console.log("cursorFile:", CURSOR_FILE, "| poolsFile:", POOLS_FILE);
   console.log("pollMs:", POLL_MS, "| confirmations:", confirmations);
+  console.log("dataSource:", explorerHost, explorerKey ? "(with key)" : "(NO KEY — 限速)");
+  console.log("watchAddresses:", watchAddresses.length ? watchAddresses.join(", ") : "(none)");
   console.log(
     "recipients:",
     recipientChatIds().length,
