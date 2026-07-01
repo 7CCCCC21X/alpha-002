@@ -198,9 +198,11 @@ let botId = 0;
 let lastRpcLatencyMs = null;
 let lastExplorerLatencyMs = null;
 let lastExplorerError = null;
-// RPC 调用计数（用于 /status 核对是否更省）
+// 调用计数（用于 /status 核对是否更省）
 let rpcCalls = 0; // 自启动以来的链上 RPC 调用累计
+let apiCalls = 0; // 自启动以来的数据源 API 调用累计（NodeReal/Ankr/Etherscan）
 let lastTickRpc = 0; // 上一轮 tick 的 RPC 调用数
+let lastTickApi = 0; // 上一轮 tick 的数据源 API 调用数
 let lastFetchCount = 0; // 上一轮数据源返回的候选交易数（rpc 模式为扫描块数）
 let lastAlert = null;
 let lastPush = { ok: 0, total: 0 };
@@ -910,12 +912,15 @@ async function buildStatusMessage() {
       lastExplorerError ? `｜⚠️ ${escapeHtml(lastExplorerError)}` : ""
     }`,
     `<b>RPC 延迟:</b> <code>${lastRpcLatencyMs ?? "?"}</code> ms`,
+    `<b>API 累计:</b> <code>${apiCalls}</code> 次（约 <code>${Math.round(
+      apiCalls / Math.max(1, (Date.now() - startedAt) / 60000)
+    )}</code>/分）`,
     `<b>RPC 累计:</b> <code>${rpcCalls}</code> 次（约 <code>${Math.round(
       rpcCalls / Math.max(1, (Date.now() - startedAt) / 60000)
     )}</code>/分）`,
     `<b>上轮:</b> ${dataSource === "rpc" ? "扫描" : "拉取"} <code>${lastFetchCount}</code> ${
       dataSource === "rpc" ? "块" : "笔"
-    } · RPC <code>${lastTickRpc}</code> 次`,
+    } · API <code>${lastTickApi}</code> · RPC <code>${lastTickRpc}</code> 次`,
     ``,
     `<b>缓存:</b> Pools <code>${poolCache.size}</code> / Tokens <code>${tokenCache.size}</code>`,
     `<b>最近告警:</b> ${escapeHtml(la)}`,
@@ -1283,6 +1288,7 @@ async function explorerTxList(address, startBlock, endBlock) {
     sort: "asc"
   });
   if (explorerKey) qs.set("apikey", explorerKey);
+  apiCalls++;
   const res = await fetch(`${explorerApi}?${qs.toString()}`, {
     signal: AbortSignal.timeout(rpcTimeoutMs)
   });
@@ -1311,6 +1317,7 @@ async function ankrTxList(address, startBlock, endBlock) {
       pageSize: 100
     };
     if (pageToken) params.pageToken = pageToken;
+    apiCalls++;
     const res = await fetch(`${ankrAdvApi}/${ankrKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1348,6 +1355,7 @@ async function noderealTxList(address, startBlock, endBlock) {
       toBlock: ethers.toQuantity(endBlock)
     };
     if (pageKey) p.pageKey = pageKey;
+    apiCalls++;
     const res = await fetch(`${noderealApi}/${noderealKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1526,6 +1534,7 @@ async function tick() {
   if (busy) return;
   busy = true;
   const rpcBefore = rpcCalls;
+  const apiBefore = apiCalls;
   try {
     // /resync 请求优先：先落盘新游标，本轮直接从新位置开始
     if (pendingResync !== null) {
@@ -1559,6 +1568,7 @@ async function tick() {
     console.error("tick 错误:", err?.message || err);
   } finally {
     lastTickRpc = rpcCalls - rpcBefore;
+    lastTickApi = apiCalls - apiBefore;
     busy = false;
   }
 }
