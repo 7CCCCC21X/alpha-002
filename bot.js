@@ -36,10 +36,18 @@ const {
   // 操作钱包：盯这个地址发起的建池/加管理员/设开盘调用。这是主过滤条件。
   FILTER_FROM = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E",
   START_BLOCK,
-  // 每隔 POLL_MS 毫秒轮询一次区块浏览器 API（不再逐块拉 RPC）
+  // 每隔 POLL_MS 毫秒轮询一次数据源，查目标地址的交易（不再逐块拉 RPC）
   POLL_MS = "10000",
-  // 数据源：区块浏览器 API（Etherscan V2 多链 / BscScan 兼容），查目标地址交易，
-  // 取代逐块 eth_getBlockByNumber，大幅降低 RPC 消耗。
+  // 数据源：查目标地址交易，取代逐块 eth_getBlockByNumber，大幅降低 RPC 消耗。
+  //   DATA_SOURCE=ankr     → Ankr Advanced API（BSC 免费额度内，推荐；Etherscan 免费版已不支持 BSC）
+  //   DATA_SOURCE=etherscan → Etherscan V2 txlist（需付费计划才含 BSC）
+  DATA_SOURCE = "ankr",
+  // —— Ankr Advanced API（DATA_SOURCE=ankr 时用）——
+  // ANKR_API_KEY 留空则自动从 RPC_URL（形如 https://rpc.ankr.com/bsc/<KEY>）里提取。
+  ANKR_ADVANCED_API = "https://rpc.ankr.com/multichain",
+  ANKR_API_KEY = "",
+  ANKR_BLOCKCHAIN = "bsc",
+  // —— Etherscan V2 / BscScan（DATA_SOURCE=etherscan 时用）——
   EXPLORER_API = "https://api.etherscan.io/v2/api",
   EXPLORER_API_KEY = "",
   EXPLORER_CHAIN_ID = "56",
@@ -99,7 +107,10 @@ const filterFrom = FILTER_FROM?.trim() ? ethers.getAddress(FILTER_FROM.trim()) :
 // 示例 / 展示用的代表合约（仅用于 /preview 示例和链接兜底）
 const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f";
 
-// 数据源配置：区块浏览器 API
+// 数据源配置
+const dataSource = String(DATA_SOURCE).trim().toLowerCase() === "etherscan" ? "etherscan" : "ankr";
+
+// Etherscan V2 / BscScan
 const explorerApi = String(EXPLORER_API).trim();
 const explorerKey = String(EXPLORER_API_KEY).trim();
 const explorerChainId = String(EXPLORER_CHAIN_ID).trim() || "56";
@@ -107,6 +118,18 @@ let explorerHost = explorerApi;
 try {
   explorerHost = new URL(explorerApi).host;
 } catch {}
+
+// Ankr Advanced API（key 缺省时从 RPC_URL 里兜底提取）
+const ankrAdvApi = String(ANKR_ADVANCED_API).trim().replace(/\/+$/, "");
+const ankrBlockchain = String(ANKR_BLOCKCHAIN).trim() || "bsc";
+const ankrKey =
+  String(ANKR_API_KEY).trim() ||
+  (String(RPC_URL).match(/rpc\.ankr\.com\/[^/]+\/([A-Za-z0-9]+)/)?.[1] ?? "");
+
+// 数据源显示名 & 是否缺 Key（供 /status 与启动日志）
+const dataSourceLabel = dataSource === "ankr" ? "Ankr Advanced API" : explorerHost;
+const dataSourceKeyMissing = dataSource === "ankr" ? !ankrKey : !explorerKey;
+
 // 轮询交易的地址：优先盯操作钱包(From)；未设钱包则退回盯目标合约。
 const watchAddresses = filterFrom ? [filterFrom] : [...targetContracts];
 
@@ -121,9 +144,14 @@ if (!filterFrom && targetContracts.size === 0) {
     "⚠️ FILTER_FROM 和 TARGET_CONTRACT 都为空：没有可轮询的地址，将收不到任何告警。请至少设置其一。"
   );
 }
-if (!explorerKey) {
+if (dataSource === "ankr" && !ankrKey) {
   console.warn(
-    "⚠️ 未设置 EXPLORER_API_KEY：Etherscan/BscScan 无 Key 限速很低，建议申请免费 Key 填入。"
+    "⚠️ DATA_SOURCE=ankr 但没有 Ankr Key：请设置 ANKR_API_KEY，或把 RPC_URL 换成带 key 的 Ankr 端点。"
+  );
+}
+if (dataSource === "etherscan" && !explorerKey) {
+  console.warn(
+    "⚠️ DATA_SOURCE=etherscan 但未设 EXPLORER_API_KEY：限速很低；且 Etherscan 免费版已不支持 BSC，需付费计划。"
   );
 }
 
@@ -839,8 +867,8 @@ async function buildStatusMessage() {
     `<b>已扫描到:</b> <code>${cursor ?? "未初始化"}</code>`,
     `<b>落后:</b> <code>${lag}</code> 块`,
     `<b>检查间隔:</b> <code>${Number(POLL_MS) / 1000}</code> 秒`,
-    `<b>数据源:</b> <code>${escapeHtml(explorerHost)}</code>${explorerKey ? "" : " ⚠️无Key"}`,
-    `<b>浏览器延迟:</b> <code>${lastExplorerLatencyMs ?? "?"}</code> ms${
+    `<b>数据源:</b> <code>${escapeHtml(dataSourceLabel)}</code>${dataSourceKeyMissing ? " ⚠️无Key" : ""}`,
+    `<b>数据源延迟:</b> <code>${lastExplorerLatencyMs ?? "?"}</code> ms${
       lastExplorerError ? `｜⚠️ ${escapeHtml(lastExplorerError)}` : ""
     }`,
     `<b>RPC 延迟:</b> <code>${lastRpcLatencyMs ?? "?"}</code> ms`,
@@ -1222,21 +1250,60 @@ async function explorerTxList(address, startBlock, endBlock) {
   throw new Error(`浏览器 API 异常：${detail}`);
 }
 
+// 用 Ankr Advanced API 查某地址在 [startBlock, endBlock] 的交易（BSC 免费额度内）。
+// 返回的交易字段（hash/from/to/input/value/blockNumber 等）与浏览器版兼容：value/blockNumber
+// 为十六进制字符串，JS 的 Number()/ethers 都能直接吃。
+async function ankrTxList(address, startBlock, endBlock) {
+  const txs = [];
+  let pageToken = "";
+  // 分页安全上限，防止异常时死循环（目标钱包交易很少，通常 1 页就够）
+  for (let i = 0; i < 50; i++) {
+    const params = {
+      blockchain: ankrBlockchain,
+      address,
+      fromBlock: startBlock,
+      toBlock: endBlock,
+      descOrder: false,
+      pageSize: 100
+    };
+    if (pageToken) params.pageToken = pageToken;
+    const res = await fetch(`${ankrAdvApi}/${ankrKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: 1, jsonrpc: "2.0", method: "ankr_getTransactionsByAddress", params }),
+      signal: AbortSignal.timeout(rpcTimeoutMs)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.error) {
+      throw new Error(`Ankr Advanced API 异常：${data.error.message || JSON.stringify(data.error)}`);
+    }
+    const result = data.result || {};
+    const rows = Array.isArray(result.transactions) ? result.transactions : [];
+    for (const r of rows) txs.push(r);
+    pageToken = result.nextPageToken || "";
+    if (!pageToken) break;
+  }
+  return txs;
+}
+
+// 按当前 DATA_SOURCE 查某地址的交易
+async function sourceTxList(address, startBlock, endBlock) {
+  if (dataSource === "etherscan") return explorerTxList(address, startBlock, endBlock);
+  return ankrTxList(address, startBlock, endBlock);
+}
+
 // 拉取所有监听地址在 (fromBlock, toBlock] 的候选交易，按 hash 去重
 async function fetchCandidateTxs(fromBlock, toBlock) {
   const t0 = Date.now();
   const seen = new Set();
   const all = [];
   for (const addr of watchAddresses) {
-    const rows = await explorerTxList(addr, fromBlock, toBlock);
+    const rows = await sourceTxList(addr, fromBlock, toBlock);
     for (const r of rows) {
       if (r?.hash && !seen.has(r.hash)) {
         seen.add(r.hash);
         all.push(r);
       }
-    }
-    if (rows.length >= 10000) {
-      console.warn(`⚠️ ${addr} 在 ${fromBlock}-${toBlock} 命中单页上限(10000)，可能需缩小区间。`);
     }
   }
   lastExplorerLatencyMs = Date.now() - t0;
@@ -1371,7 +1438,7 @@ async function main() {
   });
   console.log("cursorFile:", CURSOR_FILE, "| poolsFile:", POOLS_FILE);
   console.log("pollMs:", POLL_MS, "| confirmations:", confirmations);
-  console.log("dataSource:", explorerHost, explorerKey ? "(with key)" : "(NO KEY — 限速)");
+  console.log("dataSource:", dataSourceLabel, dataSourceKeyMissing ? "(NO KEY ⚠️)" : "(with key)");
   console.log("watchAddresses:", watchAddresses.length ? watchAddresses.join(", ") : "(none)");
   console.log(
     "recipients:",
