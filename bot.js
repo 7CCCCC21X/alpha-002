@@ -198,6 +198,10 @@ let botId = 0;
 let lastRpcLatencyMs = null;
 let lastExplorerLatencyMs = null;
 let lastExplorerError = null;
+// RPC 调用计数（用于 /status 核对是否更省）
+let rpcCalls = 0; // 自启动以来的链上 RPC 调用累计
+let lastTickRpc = 0; // 上一轮 tick 的 RPC 调用数
+let lastFetchCount = 0; // 上一轮数据源返回的候选交易数（rpc 模式为扫描块数）
 let lastAlert = null;
 let lastPush = { ok: 0, total: 0 };
 const recentAlerts = [];
@@ -297,9 +301,11 @@ async function getTokenMeta(address) {
   const c = new ethers.Contract(addr, ERC20_ABI, provider);
   const meta = { address: addr, symbol: shortAddr(addr), decimals: 18 };
   try {
+    rpcCalls++;
     meta.symbol = await withTimeout(c.symbol(), rpcTimeoutMs, "symbol");
   } catch {}
   try {
+    rpcCalls++;
     meta.decimals = Number(await withTimeout(c.decimals(), rpcTimeoutMs, "decimals"));
   } catch {}
   tokenCache.set(addr, meta);
@@ -904,6 +910,12 @@ async function buildStatusMessage() {
       lastExplorerError ? `｜⚠️ ${escapeHtml(lastExplorerError)}` : ""
     }`,
     `<b>RPC 延迟:</b> <code>${lastRpcLatencyMs ?? "?"}</code> ms`,
+    `<b>RPC 累计:</b> <code>${rpcCalls}</code> 次（约 <code>${Math.round(
+      rpcCalls / Math.max(1, (Date.now() - startedAt) / 60000)
+    )}</code>/分）`,
+    `<b>上轮:</b> ${dataSource === "rpc" ? "扫描" : "拉取"} <code>${lastFetchCount}</code> ${
+      dataSource === "rpc" ? "块" : "笔"
+    } · RPC <code>${lastTickRpc}</code> 次`,
     ``,
     `<b>缓存:</b> Pools <code>${poolCache.size}</code> / Tokens <code>${tokenCache.size}</code>`,
     `<b>最近告警:</b> ${escapeHtml(la)}`,
@@ -1363,6 +1375,7 @@ async function noderealTxList(address, startBlock, endBlock) {
   // 用 RPC 补全 input（命中判定需要 calldata）
   const txs = [];
   for (const hash of hashes) {
+    rpcCalls++;
     const tx = await withTimeout(provider.getTransaction(hash), rpcTimeoutMs, "getTransaction");
     if (tx) txs.push(tx);
   }
@@ -1399,6 +1412,7 @@ async function processMatchedTx(tx) {
   const blockNumber = Number(tx.blockNumber);
   // initializePool 的准确 poolId 依赖回执里的 Initialize 事件，故命中后仍需一次回执查询；
   // 命中很少（仅目标钱包动作），RPC 消耗可忽略。
+  rpcCalls++;
   const receipt = await withTimeout(
     provider.getTransactionReceipt(tx.hash),
     rpcTimeoutMs,
@@ -1437,6 +1451,7 @@ async function processMatchedTx(tx) {
 // DATA_SOURCE=rpc：逐块拉 eth_getBlockByNumber（在免费/自建 RPC 上零成本）。
 // 命中判定与推送复用 processMatchedTx（block 里的 tx 已含 input，回执按需再查）。
 async function scanBlockRpc(blockNumber) {
+  rpcCalls++;
   const block = await withTimeout(
     provider.send("eth_getBlockByNumber", [ethers.toQuantity(blockNumber), true]),
     rpcTimeoutMs,
@@ -1452,6 +1467,7 @@ async function scanBlockRpc(blockNumber) {
 // DATA_SOURCE=rpc 的 tick 分支：从 cursor 逐块扫到 toBlock（单轮最多 rpcMaxBlocksPerTick 块）
 async function tickRpc(cursor, latest) {
   const toBlock = Math.min(latest, cursor + rpcMaxBlocksPerTick);
+  lastFetchCount = toBlock - cursor; // 本轮扫描的块数
   let processedThrough = cursor;
   for (let n = cursor + 1; n <= toBlock; n++) {
     if (pendingResync !== null) break; // 下一轮从重置值开始
@@ -1482,6 +1498,7 @@ async function tickApi(cursor, latest) {
     return;
   }
 
+  lastFetchCount = candidates.length; // 本轮数据源返回的候选交易数
   // 命中过滤 + 按区块升序（保证 initializePool 先于同池 addPoolOwners，回复关系不乱）
   const matches = candidates
     .filter(isTargetTx)
@@ -1508,6 +1525,7 @@ let busy = false;
 async function tick() {
   if (busy) return;
   busy = true;
+  const rpcBefore = rpcCalls;
   try {
     // /resync 请求优先：先落盘新游标，本轮直接从新位置开始
     if (pendingResync !== null) {
@@ -1517,6 +1535,7 @@ async function tick() {
       console.log(`游标已重置为 ${c}`);
     }
     const t0 = Date.now();
+    rpcCalls++;
     const latestRaw = await withTimeout(provider.getBlockNumber(), rpcTimeoutMs, "getBlockNumber");
     lastRpcLatencyMs = Date.now() - t0;
     const latest = Math.max(0, latestRaw - confirmations);
@@ -1539,6 +1558,7 @@ async function tick() {
   } catch (err) {
     console.error("tick 错误:", err?.message || err);
   } finally {
+    lastTickRpc = rpcCalls - rpcBefore;
     busy = false;
   }
 }
