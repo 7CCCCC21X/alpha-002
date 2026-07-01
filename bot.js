@@ -39,9 +39,12 @@ const {
   // 每隔 POLL_MS 毫秒轮询一次数据源，查目标地址的交易（不再逐块拉 RPC）
   POLL_MS = "10000",
   // 数据源：查目标地址交易，取代逐块 eth_getBlockByNumber，大幅降低 RPC 消耗。
-  //   DATA_SOURCE=ankr     → Ankr Advanced API（BSC 免费额度内，推荐；Etherscan 免费版已不支持 BSC）
+  //   DATA_SOURCE=rpc      → 逐块拉 eth_getBlockByNumber（在免费/自建 RPC 上零成本，最省心）
+  //   DATA_SOURCE=ankr     → Ankr Advanced API（需该 Key 开通 Advanced API 权限）
   //   DATA_SOURCE=etherscan → Etherscan V2 txlist（需付费计划才含 BSC）
-  DATA_SOURCE = "ankr",
+  DATA_SOURCE = "rpc",
+  // 仅 DATA_SOURCE=rpc：逐块模式单轮最多扫多少块
+  RPC_MAX_BLOCKS_PER_TICK = "200",
   // —— Ankr Advanced API（DATA_SOURCE=ankr 时用）——
   // ANKR_API_KEY 留空则自动从 RPC_URL（形如 https://rpc.ankr.com/bsc/<KEY>）里提取。
   ANKR_ADVANCED_API = "https://rpc.ankr.com/multichain",
@@ -107,8 +110,11 @@ const filterFrom = FILTER_FROM?.trim() ? ethers.getAddress(FILTER_FROM.trim()) :
 // 示例 / 展示用的代表合约（仅用于 /preview 示例和链接兜底）
 const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f";
 
-// 数据源配置
-const dataSource = String(DATA_SOURCE).trim().toLowerCase() === "etherscan" ? "etherscan" : "ankr";
+// 数据源配置：rpc（逐块扫描，免费/自建 RPC 零成本）| ankr（Advanced API）| etherscan（V2 txlist）
+const _ds = String(DATA_SOURCE).trim().toLowerCase();
+const dataSource = _ds === "etherscan" ? "etherscan" : _ds === "rpc" ? "rpc" : "ankr";
+// 逐块模式单轮最多扫多少块（须高于出块速度以清积压；BSC 约 13 块/10 秒）
+const rpcMaxBlocksPerTick = Math.max(1, Number(RPC_MAX_BLOCKS_PER_TICK) || 200);
 
 // Etherscan V2 / BscScan
 const explorerApi = String(EXPLORER_API).trim();
@@ -127,8 +133,14 @@ const ankrKey =
   (String(RPC_URL).match(/rpc\.ankr\.com\/[^/]+\/([A-Za-z0-9]+)/)?.[1] ?? "");
 
 // 数据源显示名 & 是否缺 Key（供 /status 与启动日志）
-const dataSourceLabel = dataSource === "ankr" ? "Ankr Advanced API" : explorerHost;
-const dataSourceKeyMissing = dataSource === "ankr" ? !ankrKey : !explorerKey;
+const dataSourceLabel =
+  dataSource === "ankr"
+    ? "Ankr Advanced API"
+    : dataSource === "etherscan"
+      ? explorerHost
+      : "RPC 逐块扫描";
+const dataSourceKeyMissing =
+  dataSource === "ankr" ? !ankrKey : dataSource === "etherscan" ? !explorerKey : false;
 
 // 轮询交易的地址：优先盯操作钱包(From)；未设钱包则退回盯目标合约。
 const watchAddresses = filterFrom ? [filterFrom] : [...targetContracts];
@@ -1350,6 +1362,76 @@ async function processMatchedTx(tx) {
   console.log(`[ALERT] method=${method} block=${blockNumber} tx=${tx.hash}`);
 }
 
+// DATA_SOURCE=rpc：逐块拉 eth_getBlockByNumber（在免费/自建 RPC 上零成本）。
+// 命中判定与推送复用 processMatchedTx（block 里的 tx 已含 input，回执按需再查）。
+async function scanBlockRpc(blockNumber) {
+  const block = await withTimeout(
+    provider.send("eth_getBlockByNumber", [ethers.toQuantity(blockNumber), true]),
+    rpcTimeoutMs,
+    "eth_getBlockByNumber"
+  );
+  if (!block || !Array.isArray(block.transactions)) return;
+  for (const tx of block.transactions) {
+    if (!isTargetTx(tx)) continue;
+    await processMatchedTx(tx); // 推送失败会抛错，交由 tick 处理游标
+  }
+}
+
+// DATA_SOURCE=rpc 的 tick 分支：从 cursor 逐块扫到 toBlock（单轮最多 rpcMaxBlocksPerTick 块）
+async function tickRpc(cursor, latest) {
+  const toBlock = Math.min(latest, cursor + rpcMaxBlocksPerTick);
+  let processedThrough = cursor;
+  for (let n = cursor + 1; n <= toBlock; n++) {
+    if (pendingResync !== null) break; // 下一轮从重置值开始
+    try {
+      await scanBlockRpc(n);
+      processedThrough = n;
+    } catch (err) {
+      // 该块推送失败：游标停在上一块，下一轮重扫本块，避免漏告警
+      console.error(`扫块 ${n} 处理失败，游标不前进:`, err?.message || err);
+      break;
+    }
+  }
+  await writeCursor(processedThrough);
+  if (processedThrough < latest) {
+    console.log(`还有区块积压: cursor=${processedThrough}, latest=${latest}`);
+  }
+}
+
+// DATA_SOURCE=ankr|etherscan 的 tick 分支：一次 API 调用覆盖整个区间 (cursor, latest]
+async function tickApi(cursor, latest) {
+  let candidates;
+  try {
+    candidates = await fetchCandidateTxs(cursor + 1, latest);
+    lastExplorerError = null;
+  } catch (err) {
+    lastExplorerError = err?.message || String(err);
+    console.error("数据源拉取失败，本轮游标不前进:", lastExplorerError);
+    return;
+  }
+
+  // 命中过滤 + 按区块升序（保证 initializePool 先于同池 addPoolOwners，回复关系不乱）
+  const matches = candidates
+    .filter(isTargetTx)
+    .sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
+
+  let processedThrough = latest; // 默认推进到已确认链头
+  for (const tx of matches) {
+    if (pendingResync !== null) {
+      processedThrough = Number(tx.blockNumber) - 1;
+      break;
+    }
+    try {
+      await processMatchedTx(tx);
+    } catch (err) {
+      console.error("处理命中交易失败，游标不前进:", err?.message || err);
+      processedThrough = Number(tx.blockNumber) - 1;
+      break;
+    }
+  }
+  await writeCursor(processedThrough);
+}
+
 let busy = false;
 async function tick() {
   if (busy) return;
@@ -1380,39 +1462,8 @@ async function tick() {
     }
     if (latest <= cursor) return;
 
-    // 一次调用覆盖整个区间 (cursor, latest]，不再逐块拉 RPC
-    let candidates;
-    try {
-      candidates = await fetchCandidateTxs(cursor + 1, latest);
-      lastExplorerError = null;
-    } catch (err) {
-      lastExplorerError = err?.message || String(err);
-      console.error("浏览器 API 拉取失败，本轮游标不前进:", lastExplorerError);
-      return;
-    }
-
-    // 命中过滤 + 按区块升序（保证 initializePool 先于同池 addPoolOwners，回复关系不乱）
-    const matches = candidates
-      .filter(isTargetTx)
-      .sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
-
-    let processedThrough = latest; // 默认推进到已确认链头
-    for (const tx of matches) {
-      // 处理途中收到 /resync：放弃本轮剩余，游标交由下一轮的重置值接管
-      if (pendingResync !== null) {
-        processedThrough = Number(tx.blockNumber) - 1;
-        break;
-      }
-      try {
-        await processMatchedTx(tx);
-      } catch (err) {
-        // 推送失败：游标停在该块之前，下一轮重试，避免漏告警
-        console.error("处理命中交易失败，游标不前进:", err?.message || err);
-        processedThrough = Number(tx.blockNumber) - 1;
-        break;
-      }
-    }
-    await writeCursor(processedThrough);
+    if (dataSource === "rpc") await tickRpc(cursor, latest);
+    else await tickApi(cursor, latest);
   } catch (err) {
     console.error("tick 错误:", err?.message || err);
   } finally {
