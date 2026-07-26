@@ -39,11 +39,11 @@ const {
   // 每隔 POLL_MS 毫秒轮询一次数据源，查目标地址的交易（不再逐块拉 RPC）
   POLL_MS = "10000",
   // 数据源：怎么发现目标地址的交易，取代逐块 eth_getBlockByNumber。
-  //   DATA_SOURCE=nodereal  → NodeReal 免费索引 API 列出钱包交易，再用 RPC 补全（推荐，BSC 免费额度内）
-  //   DATA_SOURCE=rpc       → 逐块拉 eth_getBlockByNumber（免费/自建 RPC 零成本，无需 Key）
+  //   DATA_SOURCE=rpc       → 逐块拉 eth_getBlockByNumber（配免费公共 RPC 零成本、无需 Key、无月度额度可耗尽，推荐）
+  //   DATA_SOURCE=nodereal  → NodeReal 免费索引 API（免费月额度较小，24/7 每 10 秒轮询会超额）
   //   DATA_SOURCE=ankr      → Ankr Advanced API（需该 Key 开通 Advanced API 权限）
   //   DATA_SOURCE=etherscan → Etherscan V2 txlist（需付费计划才含 BSC）
-  DATA_SOURCE = "nodereal",
+  DATA_SOURCE = "rpc",
   // 仅 DATA_SOURCE=rpc：逐块模式单轮最多扫多少块
   RPC_MAX_BLOCKS_PER_TICK = "200",
   // API 模式单轮最多覆盖多少区块（防止落后太多时单轮查询范围过大）
@@ -118,7 +118,7 @@ const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5
 
 // 数据源：nodereal（免费索引 API，推荐）| rpc（逐块扫描）| ankr（Advanced API）| etherscan（V2 txlist）
 const _ds = String(DATA_SOURCE).trim().toLowerCase();
-const dataSource = ["rpc", "ankr", "etherscan", "nodereal"].includes(_ds) ? _ds : "nodereal";
+const dataSource = ["rpc", "ankr", "etherscan", "nodereal"].includes(_ds) ? _ds : "rpc";
 // 逐块模式单轮最多扫多少块（须高于出块速度以清积压；BSC 约 13 块/10 秒）
 const rpcMaxBlocksPerTick = Math.max(1, Number(RPC_MAX_BLOCKS_PER_TICK) || 200);
 // API 模式单轮最多覆盖多少区块（防止落后太多时单轮查询范围过大、把额度一次打爆）
