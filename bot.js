@@ -46,6 +46,8 @@ const {
   DATA_SOURCE = "nodereal",
   // 仅 DATA_SOURCE=rpc：逐块模式单轮最多扫多少块
   RPC_MAX_BLOCKS_PER_TICK = "200",
+  // API 模式单轮最多覆盖多少区块（防止落后太多时单轮查询范围过大）
+  API_MAX_BLOCKS_PER_TICK = "100000",
   // 仅 DATA_SOURCE=nodereal：MegaNode 端点 + 免费 API Key（https://nodereal.io 注册获取）
   NODEREAL_API = "https://bsc-mainnet.nodereal.io/v1",
   NODEREAL_API_KEY = "",
@@ -119,6 +121,8 @@ const _ds = String(DATA_SOURCE).trim().toLowerCase();
 const dataSource = ["rpc", "ankr", "etherscan", "nodereal"].includes(_ds) ? _ds : "nodereal";
 // 逐块模式单轮最多扫多少块（须高于出块速度以清积压；BSC 约 13 块/10 秒）
 const rpcMaxBlocksPerTick = Math.max(1, Number(RPC_MAX_BLOCKS_PER_TICK) || 200);
+// API 模式单轮最多覆盖多少区块（防止落后太多时单轮查询范围过大、把额度一次打爆）
+const apiMaxBlocksPerTick = Math.max(1000, Number(API_MAX_BLOCKS_PER_TICK) || 100000);
 
 // NodeReal MegaNode Enhanced API（nr_getTransactionByAddress）
 const noderealApi = String(NODEREAL_API).trim().replace(/\/+$/, "");
@@ -1496,9 +1500,11 @@ async function tickRpc(cursor, latest) {
 
 // DATA_SOURCE=ankr|etherscan 的 tick 分支：一次 API 调用覆盖整个区间 (cursor, latest]
 async function tickApi(cursor, latest) {
+  // 单轮最多覆盖 apiMaxBlocksPerTick 个区块，避免落后太多时一次查询范围过大
+  const toBlock = Math.min(latest, cursor + apiMaxBlocksPerTick);
   let candidates;
   try {
-    candidates = await fetchCandidateTxs(cursor + 1, latest);
+    candidates = await fetchCandidateTxs(cursor + 1, toBlock);
     lastExplorerError = null;
   } catch (err) {
     lastExplorerError = err?.message || String(err);
@@ -1512,7 +1518,7 @@ async function tickApi(cursor, latest) {
     .filter(isTargetTx)
     .sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
 
-  let processedThrough = latest; // 默认推进到已确认链头
+  let processedThrough = toBlock; // 默认推进到本轮覆盖的上限
   for (const tx of matches) {
     if (pendingResync !== null) {
       processedThrough = Number(tx.blockNumber) - 1;
