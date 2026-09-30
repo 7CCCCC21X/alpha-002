@@ -19,6 +19,17 @@
 | `initializePool(PoolKey key, uint256 startTimestamp, uint160 sqrtPriceX96)` | `0x57c036db` | 🚨 上线前信号：币对、状态、双向价格、Token0/1 合约地址、开始时间、PoolId、区块、Tx |
 | `addPoolOwners(bytes32 poolId, address[] owners)` | `0xfe7815ed` | 🟠 加管理员：PoolId、PancakeSwap 链接、新增 Owners、调用者（缓存命中时补充币对/Fee） |
 
+### 经 CLPositionManager 建的池子（Initialize 事件扫描）
+
+不少 Alpha 池子**不走** `Hook.initializePool`：由项目方钱包经 CLPositionManager `multicall`
+（`initializePool` + 加流动性）直接建池，交易的 From 不是操作钱包、方法选择器也不匹配，所以按交易过滤会漏掉，
+只能看到之后操作钱包发的 `setPoolStartedTimestamp`（且显示「未知池子」）。
+
+为此机器人每轮会额外对 CLPoolManager（`CL_POOL_MANAGER`，默认 `0xa0ffb9c1…058b`）跑 `eth_getLogs`
+拉 `Initialize` 事件，`hooks` 命中 `ALPHA_HOOKS`（默认 `0xb0BAa371…434d0f`、`0xb0bb171D…aD46af`，逗号分隔，留空关闭）就推送新池，
+并缓存币对，后续开盘时间 / 加管理员消息能显示币对并回复在新池消息下。已缓存的 poolId 不会重复推送。
+单次 `eth_getLogs` 最多覆盖 `INIT_LOGS_MAX_RANGE`（默认 2000）块。`/import` 也支持这类建池交易的哈希。
+
 ### poolId 以链上事件为准（重要）
 
 Hook 合约（CLAlphaHook）会**改写 PoolKey 再调用 PoolManager**，所以从 Hook 函数入参自己算出来的

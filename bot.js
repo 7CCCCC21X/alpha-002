@@ -12,6 +12,8 @@ import {
   computePoolId,
   parseCLInitializeEvent,
   parseHookPoolStartedEvent,
+  CL_INITIALIZE_TOPIC,
+  filterAlphaInitializeLogs,
   isValidPoolId,
   pancakePoolUrl,
   bscscanAddressUrl,
@@ -36,6 +38,13 @@ const {
   // 操作钱包：盯这个地址发起的建池/加管理员/设开盘调用。这是主过滤条件。
   FILTER_FROM = "0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E",
   START_BLOCK,
+  // 直接扫 CLPoolManager 的 Initialize 事件，hooks 命中这些 Alpha Hook 就推送「新池」。
+  // 覆盖项目方钱包经 CLPositionManager 建池（不走 Hook.initializePool、From 也不是操作钱包）的情况。
+  // 逗号分隔；留空 = 关闭事件扫描。
+  ALPHA_HOOKS = "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f,0xb0bb171D333569CfD28a37F5c5DdDAAa90aD46af",
+  CL_POOL_MANAGER = "0xa0ffb9c1ce1fe56963b0321b32e7a0302114058b",
+  // 单次 eth_getLogs 最多覆盖多少块（公共 RPC 通常限制几千块）
+  INIT_LOGS_MAX_RANGE = "2000",
   // 每隔 POLL_MS 毫秒轮询一次数据源，查目标地址的交易（不再逐块拉 RPC）
   POLL_MS = "10000",
   // 数据源：怎么发现目标地址的交易，取代逐块 eth_getBlockByNumber。
@@ -113,6 +122,15 @@ const targetContracts = new Set(
     .map((a) => ethers.getAddress(a).toLowerCase())
 );
 const filterFrom = FILTER_FROM?.trim() ? ethers.getAddress(FILTER_FROM.trim()) : "";
+const alphaHooks = new Set(
+  String(ALPHA_HOOKS)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((a) => ethers.getAddress(a).toLowerCase())
+);
+const clPoolManager = CL_POOL_MANAGER?.trim() ? ethers.getAddress(CL_POOL_MANAGER.trim()) : "";
+const initLogsMaxRange = Math.max(1, Number(INIT_LOGS_MAX_RANGE) || 2000);
 // 示例 / 展示用的代表合约（仅用于 /preview 示例和链接兜底）
 const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f";
 
@@ -498,6 +516,67 @@ async function buildAlertMessage(tx, blockNumber, parsed, receipt) {
   };
 }
 
+// 由 CLPoolManager 的 Initialize 事件构造「新池」告警（建池交易不经 Hook.initializePool 时用）。
+// creator = 建池交易的发起钱包（通常是项目方，经 CLPositionManager 建池 + 加流动性）。
+async function buildInitEventMessage(ev, creator) {
+  const [t0, t1] = await Promise.all([getTokenMeta(ev.currency0), getTokenMeta(ev.currency1)]);
+  const pair = `${t0.symbol} / ${t1.symbol}`;
+  const prices = formatPrices(ev.sqrtPriceX96, t0.decimals, t1.decimals);
+  const poolInfo = {
+    poolId: ev.poolId,
+    token0: t0,
+    token1: t1,
+    hooks: ev.hooks,
+    poolManager: ev.poolManager,
+    fee: ev.fee.toString(),
+    parameters: String(ev.parameters),
+    startTimestamp: null,
+    sqrtPriceX96: ev.sqrtPriceX96.toString(),
+    price: prices,
+    initTx: ev.txHash,
+    initBlock: ev.blockNumber
+  };
+
+  const lines = [
+    `🚨 <b>Binance Alpha代币 上线前信号｜${escapeHtml(pair)}</b>`,
+    ``,
+    `🟢 <b>状态：</b>Alpha 流动性池已初始化`,
+    ``
+  ];
+  if (prices) {
+    lines.push(
+      `💰 <b>初始价格</b>`,
+      `1 ${escapeHtml(t0.symbol)} ≈ <code>${prices.forward}</code> ${escapeHtml(t1.symbol)}`,
+      `1 ${escapeHtml(t1.symbol)} ≈ <code>${prices.inverse}</code> ${escapeHtml(t0.symbol)}`,
+      ``
+    );
+  }
+  lines.push(
+    `🪙 <b>${escapeHtml(t0.symbol)} 合约：</b><code>${ev.currency0}</code>`,
+    `💵 <b>${escapeHtml(t1.symbol)} 合约：</b><code>${ev.currency1}</code>`,
+    ``,
+    `⏰ <b>开始时间：</b>待定（等待 setPoolStartedTimestamp）`,
+    creator ? `👤 <b>建池钱包：</b><code>${creator}</code>` : null,
+    `🧩 <b>PoolId：</b><code>${shortPoolId(ev.poolId)}</code>`,
+    `📦 <b>区块：</b><code>${ev.blockNumber}</code>`,
+    `🔎 <b>Tx：</b><a href="https://bscscan.com/tx/${ev.txHash}">${shortAddr(ev.txHash)}</a>`
+  );
+
+  const reply_markup = buildPoolKeyboard({
+    poolId: ev.poolId,
+    txHash: ev.txHash,
+    secondRow: [{ text: "🧩 Hook 合约", url: bscscanAddressUrl(ev.hooks) }]
+  });
+
+  return {
+    text: lines.filter((l) => l !== null).join("\n") + communityFooter(),
+    reply_markup,
+    poolInfo,
+    pair,
+    poolId: ev.poolId
+  };
+}
+
 async function buildAddOwnersMessage(tx, blockNumber, parsed) {
   const poolId = String(parsed.args.poolId ?? parsed.args[0]).toLowerCase();
   const owners = (parsed.args.owners ?? parsed.args[1] ?? []).map((a) => ethers.getAddress(a));
@@ -665,11 +744,37 @@ async function buildImportResult(txHash) {
     return { text: `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>` };
   }
   if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
+  // 不是 Hook.initializePool 的建池交易（如经 CLPositionManager 建池）：按回执里的 Initialize 事件导入
+  if (matchedMethod(tx.data) !== "initializePool") {
+    const receipt = await withTimeout(
+      provider.getTransactionReceipt(txHash),
+      rpcTimeoutMs,
+      "getTransactionReceipt"
+    ).catch(() => null);
+    const [ev] = filterAlphaInitializeLogs(receipt?.logs, alphaHooks);
+    if (!ev) {
+      return {
+        text: `⚠️ 该交易既不是 initializePool 调用，也没有 Alpha Hook 池子的 Initialize 事件，无法导入。`
+      };
+    }
+    try {
+      const built = await buildInitEventMessage(ev, ethers.getAddress(tx.from));
+      await savePoolInfo(built.poolInfo);
+      const text = [
+        `✅ <b>Pool imported</b> | ${escapeHtml(built.pair)}`,
+        ``,
+        `<b>PoolId:</b> <code>${ev.poolId}</code>`,
+        `<b>PancakeSwap:</b> <a href="${pancakePoolUrl(ev.poolId)}">🥞 Open Pool</a>`,
+        ``,
+        `现在 /pool ${ev.poolId} 可直接查询，addPoolOwners 也能显示币对。`
+      ].join("\n");
+      return { text, reply_markup: built.reply_markup };
+    } catch (err) {
+      return { text: `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>` };
+    }
+  }
   if (!isWatchedContract(tx.to)) {
     return { text: `⚠️ 该交易的 To 不在监听的合约范围内，无法导入。` };
-  }
-  if (matchedMethod(tx.data) !== "initializePool") {
-    return { text: `⚠️ 只能导入 initializePool 交易（该交易方法不匹配）。` };
   }
   try {
     const parsed = iface.parseTransaction({ data: tx.data, value: tx.value ?? 0 });
@@ -1325,12 +1430,19 @@ async function ankrTxList(address, startBlock, endBlock) {
     const res = await fetch(`${ankrAdvApi}/${ankrKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: 1, jsonrpc: "2.0", method: "ankr_getTransactionsByAddress", params }),
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "ankr_getTransactionsByAddress",
+        params
+      }),
       signal: AbortSignal.timeout(rpcTimeoutMs)
     });
     const data = await res.json().catch(() => ({}));
     if (data.error) {
-      throw new Error(`Ankr Advanced API 异常：${data.error.message || JSON.stringify(data.error)}`);
+      throw new Error(
+        `Ankr Advanced API 异常：${data.error.message || JSON.stringify(data.error)}`
+      );
     }
     const result = data.result || {};
     const rows = Array.isArray(result.transactions) ? result.transactions : [];
@@ -1363,7 +1475,12 @@ async function noderealTxList(address, startBlock, endBlock) {
     const res = await fetch(`${noderealApi}/${noderealKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: 1, jsonrpc: "2.0", method: "nr_getTransactionByAddress", params: [p] }),
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "nr_getTransactionByAddress",
+        params: [p]
+      }),
       signal: AbortSignal.timeout(rpcTimeoutMs)
     });
     const data = await res.json().catch(() => ({}));
@@ -1458,6 +1575,51 @@ async function processMatchedTx(tx) {
   recordAlert({ method, txHash: tx.hash, pair: built.pair, blockNumber });
   if (built.poolInfo) await savePoolInfo(built.poolInfo);
   console.log(`[ALERT] method=${method} block=${blockNumber} tx=${tx.hash}`);
+}
+
+// 扫 (fromBlock, toBlock] 内 CLPoolManager 的 Initialize 事件，hooks 命中 Alpha Hook 就推送新池。
+// 已缓存的 poolId、以及由操作钱包经 Hook.initializePool 发起的（交易分支会推送）跳过，避免重复。
+// 推送失败抛错，由 tick 让游标不前进。
+async function scanAlphaInitLogs(fromBlock, toBlock) {
+  if (!alphaHooks.size || !clPoolManager || toBlock <= fromBlock) return;
+  for (let start = fromBlock + 1; start <= toBlock; start += initLogsMaxRange) {
+    const end = Math.min(toBlock, start + initLogsMaxRange - 1);
+    rpcCalls++;
+    const logs = await withTimeout(
+      provider.getLogs({
+        address: clPoolManager,
+        topics: [CL_INITIALIZE_TOPIC],
+        fromBlock: start,
+        toBlock: end
+      }),
+      rpcTimeoutMs,
+      "getLogs(Initialize)"
+    );
+    for (const ev of filterAlphaInitializeLogs(logs, alphaHooks)) {
+      if (poolCache.has(ev.poolId)) continue;
+      let tx = null;
+      try {
+        rpcCalls++;
+        tx = await withTimeout(provider.getTransaction(ev.txHash), rpcTimeoutMs, "getTransaction");
+      } catch {}
+      if (tx && isTargetTx(tx) && matchedMethod(tx.data) === "initializePool") continue;
+      const built = await buildInitEventMessage(ev, tx?.from ? ethers.getAddress(tx.from) : null);
+      const okCount = await sendTelegram(
+        built.text,
+        { reply_markup: built.reply_markup },
+        { poolId: built.poolId, rememberPoolMessage: true }
+      );
+      if (okCount === 0) throw new Error(`Telegram 推送失败，Initialize tx=${ev.txHash}`);
+      recordAlert({
+        method: "initializePool",
+        txHash: ev.txHash,
+        pair: built.pair,
+        blockNumber: ev.blockNumber
+      });
+      await savePoolInfo(built.poolInfo);
+      console.log(`[ALERT] method=Initialize(event) block=${ev.blockNumber} tx=${ev.txHash}`);
+    }
+  }
 }
 
 // DATA_SOURCE=rpc：逐块拉 eth_getBlockByNumber（在免费/自建 RPC 上零成本）。
@@ -1567,6 +1729,18 @@ async function tick() {
       return;
     }
     if (latest <= cursor) return;
+
+    // 先扫 Initialize 事件（同一区间内先推新池，后续 setPoolStartedTimestamp / addPoolOwners 才能带上币对）
+    const eventTo = Math.min(
+      latest,
+      cursor + (dataSource === "rpc" ? rpcMaxBlocksPerTick : apiMaxBlocksPerTick)
+    );
+    try {
+      await scanAlphaInitLogs(cursor, eventTo);
+    } catch (err) {
+      console.error("扫 Initialize 事件失败，本轮游标不前进:", err?.message || err);
+      return;
+    }
 
     if (dataSource === "rpc") await tickRpc(cursor, latest);
     else await tickApi(cursor, latest);

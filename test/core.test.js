@@ -8,6 +8,8 @@ import {
   computePoolId,
   parseCLInitializeEvent,
   parseHookPoolStartedEvent,
+  filterAlphaInitializeLogs,
+  CL_INITIALIZE_TOPIC,
   CL_POOL_MANAGER_ABI,
   HOOK_EVENT_ABI,
   isValidPoolId,
@@ -129,6 +131,61 @@ describe("parseCLInitializeEvent", () => {
   it("returns null when there is no Initialize log", () => {
     expect(parseCLInitializeEvent([], poolManager)).toBe(null);
     expect(parseCLInitializeEvent(null, poolManager)).toBe(null);
+  });
+});
+
+describe("filterAlphaInitializeLogs", () => {
+  // 真实链上日志：0xA984… 经 CLPositionManager 建池（不走 Hook.initializePool）
+  const mgrIface = new ethers.Interface(CL_POOL_MANAGER_ABI);
+  const poolManager = "0xa0ffb9c1ce1fe56963b0321b32e7a0302114058b";
+  const poolId = "0x0ed93383c381227876010a8b163e54baba7d5726636b04dd9201806f299f0862";
+  const alphaHook = "0xb0BAa371b899950B4Ef6A27c21bAf5ef7c434d0f";
+  const mk = (hooks, blockNumber, logIndex) => {
+    const enc = mgrIface.encodeEventLog("Initialize", [
+      poolId,
+      "0x0A092E544DA31150b439a1aAA1A3a2214a867F46",
+      "0x55d398326f99059fF775485246999027B3197955",
+      hooks,
+      67,
+      "0x00000000000000000000000000000000000000000000000000000000000a0045",
+      "26277008790225401207434088831",
+      -22074
+    ]);
+    return {
+      address: poolManager,
+      topics: enc.topics,
+      data: enc.data,
+      transactionHash: "0x" + "ab".repeat(32),
+      blockNumber,
+      logIndex
+    };
+  };
+  const hooks = new Set([alphaHook.toLowerCase()]);
+
+  it("topic0 matches the on-chain Initialize event", () => {
+    expect(CL_INITIALIZE_TOPIC).toBe(
+      "0x426cc62fe6a33a40ba2788c2c87a9c34ee4582b95bc9fa5a7bb7ae70b750b99c"
+    );
+  });
+  it("keeps pools whose hooks is an Alpha hook", () => {
+    const [r] = filterAlphaInitializeLogs([mk(alphaHook, 10, 174)], hooks);
+    expect(r.poolId).toBe(poolId);
+    expect(r.fee).toBe(67n);
+    expect(r.tick).toBe(-22074n);
+    expect(r.blockNumber).toBe(10);
+    expect(r.poolManager.toLowerCase()).toBe(poolManager);
+  });
+  it("drops pools with other hooks and sorts by block/logIndex", () => {
+    const other = "0x0000000000000000000000000000000000000001";
+    const r = filterAlphaInitializeLogs(
+      [mk(alphaHook, 12, 1), mk(other, 11, 1), mk(alphaHook, 11, 5)],
+      hooks
+    );
+    expect(r.map((x) => [x.blockNumber, x.logIndex])).toEqual([
+      [11, 5],
+      [12, 1]
+    ]);
+    expect(filterAlphaInitializeLogs(null, hooks)).toEqual([]);
   });
 });
 
