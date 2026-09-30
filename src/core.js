@@ -101,6 +101,31 @@ export function parseCLInitializeEvent(logs, expectedPoolManager) {
   return scan(expected) || (expected ? scan(null) : null);
 }
 
+export const CL_INITIALIZE_TOPIC = clPoolManagerIface
+  .getEvent("Initialize")
+  .topicHash.toLowerCase();
+
+// 过滤 Initialize 日志：只保留 hooks 在 alphaHooks（小写地址集合）里的池子，返回解析结果数组。
+// 用于直接扫 CLPoolManager 的 eth_getLogs —— 很多 Alpha 池子是项目方钱包经 CLPositionManager
+// multicall 建的（不走 Hook.initializePool，也不是操作钱包发起），只能靠事件发现。
+export function filterAlphaInitializeLogs(logs, alphaHooks) {
+  if (!Array.isArray(logs)) return [];
+  const out = [];
+  for (const log of logs) {
+    const ev = parseCLInitializeEvent([log], null);
+    if (!ev) continue;
+    if (alphaHooks && alphaHooks.size && !alphaHooks.has(ev.hooks.toLowerCase())) continue;
+    out.push({
+      ...ev,
+      poolManager: ethers.getAddress(log.address),
+      txHash: log.transactionHash,
+      blockNumber: Number(log.blockNumber),
+      logIndex: Number(log.logIndex ?? log.index ?? 0)
+    });
+  }
+  return out.sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex);
+}
+
 // CLAlphaHook 自己也会 emit PoolStartedAtUpdated(bytes32 indexed poolId, uint256 startedTimestamp, address operator)
 // 里面带真实 poolId 和准确的开始时间，可作为 poolId 的备用来源 + 准确开始时间。
 export const HOOK_EVENT_ABI = [
