@@ -14,6 +14,7 @@ import {
   parseHookPoolStartedEvent,
   CL_INITIALIZE_TOPIC,
   filterAlphaInitializeLogs,
+  findFirstNonceIncrease,
   isValidPoolId,
   pancakePoolUrl,
   bscscanAddressUrl,
@@ -45,8 +46,11 @@ const {
   CL_POOL_MANAGER = "0xa0ffb9c1ce1fe56963b0321b32e7a0302114058b",
   // 单次 eth_getLogs 最多覆盖多少块（公共 RPC 通常限制几千块）
   INIT_LOGS_MAX_RANGE = "2000",
-  // 每隔 POLL_MS 毫秒轮询一次数据源，查目标地址的交易（不再逐块拉 RPC）
+  // 每隔 POLL_MS 毫秒轮询一次数据源
   POLL_MS = "10000",
+  // 仅 DATA_SOURCE=rpc 且设了 FILTER_FROM：先比对操作钱包两端的 nonce，没发交易就整段跳过、不拉区块，
+  // 有交易才二分定位到具体区块再拉。RPC 查不了历史 nonce 时自动退回逐块扫描。设 0 关闭。
+  NONCE_GATE = "1",
   // 数据源：怎么发现目标地址的交易，取代逐块 eth_getBlockByNumber。
   //   DATA_SOURCE=rpc       → 逐块拉 eth_getBlockByNumber（配免费公共 RPC 零成本、无需 Key、无月度额度可耗尽，推荐）
   //   DATA_SOURCE=nodereal  → NodeReal 免费索引 API（免费月额度较小，24/7 每 10 秒轮询会超额）
@@ -112,7 +116,9 @@ const whitelist = new Set(
 const rpcTimeoutMs = Number(RPC_TIMEOUT_MS) || 15000;
 const confirmations = Math.max(0, Number(CONFIRMATIONS) || 0);
 
-const provider = new ethers.JsonRpcProvider(RPC_URL);
+// staticNetwork：启动时查一次 chainId 后就不再查。默认每次 getLogs / getTransaction 等都会附带
+// 一次 eth_chainId 检测网络是否变了，白白多占公共 RPC 的限流额度。
+const provider = new ethers.JsonRpcProvider(RPC_URL, undefined, { staticNetwork: true });
 // 限定的合约集合（小写）。空 = 不限合约。
 const targetContracts = new Set(
   String(TARGET_CONTRACT)
@@ -137,8 +143,13 @@ const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5
 // 数据源：nodereal（免费索引 API，推荐）| rpc（逐块扫描）| ankr（Advanced API）| etherscan（V2 txlist）
 const _ds = String(DATA_SOURCE).trim().toLowerCase();
 const dataSource = ["rpc", "ankr", "etherscan", "nodereal"].includes(_ds) ? _ds : "rpc";
-// 逐块模式单轮最多扫多少块（须高于出块速度以清积压；BSC 约 13 块/10 秒）
+// 逐块模式单轮最多扫多少块（须高于出块速度以清积压；BSC 0.45 秒一块，约 22 块/10 秒）
 const rpcMaxBlocksPerTick = Math.max(1, Number(RPC_MAX_BLOCKS_PER_TICK) || 200);
+// nonce 闸门：只有盯钱包（FILTER_FROM）时才成立——命中条件要求 From 是该钱包，钱包没发交易就不可能命中
+const nonceGateEnabled =
+  dataSource === "rpc" &&
+  Boolean(filterFrom) &&
+  !["0", "false", "off", "no"].includes(String(NONCE_GATE).trim().toLowerCase());
 // API 模式单轮最多覆盖多少区块（防止落后太多时单轮查询范围过大、把额度一次打爆）
 const apiMaxBlocksPerTick = Math.max(1000, Number(API_MAX_BLOCKS_PER_TICK) || 100000);
 
@@ -225,7 +236,11 @@ let rpcCalls = 0; // 自启动以来的链上 RPC 调用累计
 let apiCalls = 0; // 自启动以来的数据源 API 调用累计（NodeReal/Ankr/Etherscan）
 let lastTickRpc = 0; // 上一轮 tick 的 RPC 调用数
 let lastTickApi = 0; // 上一轮 tick 的数据源 API 调用数
-let lastFetchCount = 0; // 上一轮数据源返回的候选交易数（rpc 模式为扫描块数）
+let lastFetchCount = 0; // 上一轮数据源返回的候选交易数（rpc 模式为覆盖块数）
+let lastFullBlocks = 0; // 上一轮实际拉取的完整区块数（rpc 模式）
+let lastNonceGateError = null; // nonce 闸门最近一次失败原因（退回逐块扫描时）
+let initLogsFailStreak = 0; // Initialize 事件扫描（eth_getLogs）连续失败次数
+let lastInitLogsError = null;
 let lastAlert = null;
 let lastPush = { ok: 0, total: 0 };
 const recentAlerts = [];
@@ -233,6 +248,13 @@ const recentAlerts = [];
 let pendingResync = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ethers 的 RPC 报错很长（could not coalesce error (error={...}, payload={...})），取节点原话便于看
+function rpcErrorMessage(err) {
+  const e = err?.error;
+  if (e?.message) return e.code != null ? `${e.message} (code ${e.code})` : String(e.message);
+  return err?.shortMessage || err?.message || String(err);
+}
 
 function withTimeout(promise, ms, label = "operation") {
   let timer;
@@ -1027,9 +1049,31 @@ async function buildStatusMessage() {
     `<b>RPC 累计:</b> <code>${rpcCalls}</code> 次（约 <code>${Math.round(
       rpcCalls / Math.max(1, (Date.now() - startedAt) / 60000)
     )}</code>/分）`,
-    `<b>上轮:</b> ${dataSource === "rpc" ? "扫描" : "拉取"} <code>${lastFetchCount}</code> ${
-      dataSource === "rpc" ? "块" : "笔"
-    } · API <code>${lastTickApi}</code> · RPC <code>${lastTickRpc}</code> 次`,
+    dataSource === "rpc"
+      ? `<b>上轮:</b> 覆盖 <code>${lastFetchCount}</code> 块，拉完整区块 <code>${lastFullBlocks}</code> 块 · RPC <code>${lastTickRpc}</code> 次`
+      : `<b>上轮:</b> 拉取 <code>${lastFetchCount}</code> 笔 · API <code>${lastTickApi}</code> · RPC <code>${lastTickRpc}</code> 次`,
+    ...(dataSource === "rpc"
+      ? [
+          `<b>nonce 省流:</b> ${
+            !nonceGateEnabled
+              ? `关闭（${filterFrom ? "NONCE_GATE=0" : "未设 FILTER_FROM"}，每块都拉）`
+              : lastNonceGateError
+                ? `⚠️ 退回逐块扫描：${escapeHtml(lastNonceGateError)}`
+                : "开启 ✅（钱包没发交易就不拉区块）"
+          }`
+        ]
+      : []),
+    `<b>Initialize 事件扫描:</b> ${
+      !alphaHooks.size || !clPoolManager
+        ? "关闭"
+        : lastInitLogsError
+          ? `⚠️ 连续失败 ${initLogsFailStreak} 次${
+              initLogsFailStreak >= 3
+                ? "（已跳过，经 CLPositionManager 建的池子收不到，请换支持 eth_getLogs 的 RPC）"
+                : ""
+            }：${escapeHtml(lastInitLogsError)}`
+          : "正常 ✅"
+    }`,
     ``,
     `<b>缓存:</b> Pools <code>${poolCache.size}</code> / Tokens <code>${tokenCache.size}</code>`,
     `<b>最近告警:</b> ${escapeHtml(la)}`,
@@ -1585,16 +1629,23 @@ async function scanAlphaInitLogs(fromBlock, toBlock) {
   for (let start = fromBlock + 1; start <= toBlock; start += initLogsMaxRange) {
     const end = Math.min(toBlock, start + initLogsMaxRange - 1);
     rpcCalls++;
-    const logs = await withTimeout(
-      provider.getLogs({
-        address: clPoolManager,
-        topics: [CL_INITIALIZE_TOPIC],
-        fromBlock: start,
-        toBlock: end
-      }),
-      rpcTimeoutMs,
-      "getLogs(Initialize)"
-    );
+    let logs;
+    try {
+      logs = await withTimeout(
+        provider.getLogs({
+          address: clPoolManager,
+          topics: [CL_INITIALIZE_TOPIC],
+          fromBlock: start,
+          toBlock: end
+        }),
+        rpcTimeoutMs,
+        "getLogs(Initialize)"
+      );
+    } catch (err) {
+      // 标记为「查询失败」（区别于推送失败），runInitLogsScan 据此决定是否跳过
+      err.isLogsQuery = true;
+      throw err;
+    }
     for (const ev of filterAlphaInitializeLogs(logs, alphaHooks)) {
       if (poolCache.has(ev.poolId)) continue;
       let tx = null;
@@ -1622,26 +1673,91 @@ async function scanAlphaInitLogs(fromBlock, toBlock) {
   }
 }
 
-// DATA_SOURCE=rpc：逐块拉 eth_getBlockByNumber（在免费/自建 RPC 上零成本）。
+// DATA_SOURCE=rpc：拉一个完整区块 eth_getBlockByNumber（在免费/自建 RPC 上零成本）。
 // 命中判定与推送复用 processMatchedTx（block 里的 tx 已含 input，回执按需再查）。
 async function scanBlockRpc(blockNumber) {
   rpcCalls++;
+  lastFullBlocks++;
   const block = await withTimeout(
     provider.send("eth_getBlockByNumber", [ethers.toQuantity(blockNumber), true]),
     rpcTimeoutMs,
     "eth_getBlockByNumber"
   );
-  if (!block || !Array.isArray(block.transactions)) return;
+  // 负载均衡的公共 RPC 偶尔会把请求打到还没同步到该块的节点，返回 null。
+  // 必须当失败处理（游标不前进、下轮重扫），不能当成「空块」跳过，否则会漏块。
+  if (!block || !Array.isArray(block.transactions)) {
+    throw new Error(`RPC 没返回区块 ${blockNumber}（节点可能还没同步到）`);
+  }
   for (const tx of block.transactions) {
     if (!isTargetTx(tx)) continue;
     await processMatchedTx(tx); // 推送失败会抛错，交由 tick 处理游标
   }
 }
 
-// DATA_SOURCE=rpc 的 tick 分支：从 cursor 逐块扫到 toBlock（单轮最多 rpcMaxBlocksPerTick 块）
-async function tickRpc(cursor, latest) {
-  const toBlock = Math.min(latest, cursor + rpcMaxBlocksPerTick);
-  lastFetchCount = toBlock - cursor; // 本轮扫描的块数
+// 操作钱包在某区块高度时的 nonce（= 截至该块它发出的交易数）。已确认区块的值不会变，可缓存。
+const nonceCache = new Map();
+async function walletNonceAt(blockNumber) {
+  if (nonceCache.has(blockNumber)) return nonceCache.get(blockNumber);
+  rpcCalls++;
+  const n = await withTimeout(
+    provider.getTransactionCount(filterFrom, blockNumber),
+    rpcTimeoutMs,
+    "getTransactionCount"
+  );
+  if (nonceCache.size > 256) nonceCache.clear();
+  nonceCache.set(blockNumber, n);
+  return n;
+}
+
+// nonce 闸门扫描 (cursor, toBlock]：钱包 nonce 没变 = 区间内它没发交易 = 不可能命中，整段跳过；
+// 变了就二分找到含它交易的区块，只拉这些块。空闲时每轮只多 1 次轻量查询，不拉任何区块。
+// 返回 { done: true } 表示本轮已处理完（含推送失败、游标停住待重试）；
+// { done: false, cursor } 表示 RPC 查不了某高度的 nonce（无历史状态 / 节点未同步），由调用方从 cursor 起逐块扫。
+async function tickRpcNonceGated(cursor, toBlock) {
+  let lo = cursor; // 已确认处理完的最高块
+  try {
+    let n0 = await walletNonceAt(lo);
+    const n1 = await walletNonceAt(toBlock);
+    if (n1 < n0) throw new Error(`nonce 倒退 ${n0} → ${n1}（节点数据不一致）`);
+    while (n0 < n1) {
+      if (pendingResync !== null) return { done: true }; // 下一轮从重置值开始
+      const b = await findFirstNonceIncrease(lo, toBlock, n0, walletNonceAt);
+      // (lo, b-1] 里钱包没发交易，可以直接前进
+      if (b - 1 > lo) {
+        await writeCursor(b - 1);
+        lo = b - 1;
+      }
+      try {
+        await scanBlockRpc(b);
+      } catch (err) {
+        // 该块推送失败 / 没拉到：游标停在 b-1，下一轮重扫本块，避免漏告警
+        console.error(`扫块 ${b} 处理失败，游标不前进:`, err?.message || err);
+        return { done: true };
+      }
+      await writeCursor(b);
+      lo = b;
+      n0 = await walletNonceAt(b);
+    }
+    await writeCursor(toBlock);
+    if (lastNonceGateError !== null) console.log("nonce 闸门已恢复，不再逐块拉区块");
+    lastNonceGateError = null;
+    return { done: true };
+  } catch (err) {
+    const msg = rpcErrorMessage(err);
+    // 只在「正常 → 失败」时打一次，追积压期间不刷屏（/status 会显示最近原因）
+    if (lastNonceGateError === null) {
+      console.warn(
+        `nonce 闸门不可用，退回逐块扫描（从 ${lo + 1} 起；落后太多时节点没有那么早的状态，追上后自动恢复）:`,
+        msg
+      );
+    }
+    lastNonceGateError = msg;
+    return { done: false, cursor: lo };
+  }
+}
+
+// 逐块扫 (cursor, toBlock]
+async function tickRpcLinear(cursor, toBlock) {
   let processedThrough = cursor;
   for (let n = cursor + 1; n <= toBlock; n++) {
     if (pendingResync !== null) break; // 下一轮从重置值开始
@@ -1649,14 +1765,55 @@ async function tickRpc(cursor, latest) {
       await scanBlockRpc(n);
       processedThrough = n;
     } catch (err) {
-      // 该块推送失败：游标停在上一块，下一轮重扫本块，避免漏告警
+      // 该块推送失败 / 没拉到：游标停在上一块，下一轮重扫本块，避免漏告警
       console.error(`扫块 ${n} 处理失败，游标不前进:`, err?.message || err);
       break;
     }
   }
   await writeCursor(processedThrough);
-  if (processedThrough < latest) {
-    console.log(`还有区块积压: cursor=${processedThrough}, latest=${latest}`);
+}
+
+// DATA_SOURCE=rpc 的 tick 分支：处理 (cursor, toBlock]（toBlock 已按 rpcMaxBlocksPerTick 截断）
+async function tickRpc(cursor, toBlock) {
+  lastFetchCount = toBlock - cursor; // 本轮覆盖的块数
+  if (nonceGateEnabled) {
+    const r = await tickRpcNonceGated(cursor, toBlock);
+    if (r.done) return;
+    cursor = r.cursor;
+  }
+  await tickRpcLinear(cursor, toBlock);
+}
+
+// Initialize 事件扫描。返回 false = 本轮别前进游标。
+// 查询失败（eth_getLogs 报错）连续 3 轮后就跳过事件扫描、继续扫交易：有的免费 RPC 根本不支持
+// eth_getLogs（如 bsc-dataseed.binance.org 一律返回 limit exceeded），不能让整个机器人因此卡死。
+// 推送失败则始终不前进游标（Telegram 恢复后重推）。
+async function runInitLogsScan(cursor, toBlock) {
+  try {
+    await scanAlphaInitLogs(cursor, toBlock);
+    initLogsFailStreak = 0;
+    lastInitLogsError = null;
+    return true;
+  } catch (err) {
+    const msg = rpcErrorMessage(err);
+    if (!err?.isLogsQuery) {
+      console.error("推送 Initialize 新池失败，本轮游标不前进:", msg);
+      return false;
+    }
+    initLogsFailStreak++;
+    lastInitLogsError = msg;
+    if (initLogsFailStreak < 3) {
+      console.error("扫 Initialize 事件失败，本轮游标不前进:", msg);
+      return false;
+    }
+    if (initLogsFailStreak === 3 || initLogsFailStreak % 360 === 0) {
+      console.error(
+        `扫 Initialize 事件已连续失败 ${initLogsFailStreak} 次（RPC 可能不支持 eth_getLogs），跳过事件扫描、继续扫交易。` +
+          `经 CLPositionManager 建的池子会收不到，建议换 RPC_URL（如 https://bsc-rpc.publicnode.com）:`,
+        msg
+      );
+    }
+    return true;
   }
 }
 
@@ -1703,6 +1860,7 @@ async function tick() {
   busy = true;
   const rpcBefore = rpcCalls;
   const apiBefore = apiCalls;
+  lastFullBlocks = 0;
   try {
     // /resync 请求优先：先落盘新游标，本轮直接从新位置开始
     if (pendingResync !== null) {
@@ -1730,20 +1888,17 @@ async function tick() {
     }
     if (latest <= cursor) return;
 
-    // 先扫 Initialize 事件（同一区间内先推新池，后续 setPoolStartedTimestamp / addPoolOwners 才能带上币对）
-    const eventTo = Math.min(
+    // 本轮处理 (cursor, toBlock]：事件扫描和交易扫描用同一区间，游标不会越过没扫过事件的块
+    const toBlock = Math.min(
       latest,
       cursor + (dataSource === "rpc" ? rpcMaxBlocksPerTick : apiMaxBlocksPerTick)
     );
-    try {
-      await scanAlphaInitLogs(cursor, eventTo);
-    } catch (err) {
-      console.error("扫 Initialize 事件失败，本轮游标不前进:", err?.message || err);
-      return;
-    }
+    // 先扫 Initialize 事件（同一区间内先推新池，后续 setPoolStartedTimestamp / addPoolOwners 才能带上币对）
+    if (!(await runInitLogsScan(cursor, toBlock))) return;
 
-    if (dataSource === "rpc") await tickRpc(cursor, latest);
-    else await tickApi(cursor, latest);
+    if (dataSource === "rpc") await tickRpc(cursor, toBlock);
+    else await tickApi(cursor, toBlock);
+    if (toBlock < latest) console.log(`还有区块积压: 本轮到 ${toBlock}, latest=${latest}`);
   } catch (err) {
     console.error("tick 错误:", err?.message || err);
   } finally {
@@ -1772,6 +1927,12 @@ async function main() {
   console.log("cursorFile:", CURSOR_FILE, "| poolsFile:", POOLS_FILE);
   console.log("pollMs:", POLL_MS, "| confirmations:", confirmations);
   console.log("dataSource:", dataSourceLabel, dataSourceKeyMissing ? "(NO KEY ⚠️)" : "(with key)");
+  if (dataSource === "rpc") {
+    console.log(
+      "nonceGate:",
+      nonceGateEnabled ? "on（钱包没发交易就不拉区块）" : "off（每块都拉完整区块）"
+    );
+  }
   console.log("watchAddresses:", watchAddresses.length ? watchAddresses.join(", ") : "(none)");
   console.log(
     "recipients:",

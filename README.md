@@ -5,7 +5,8 @@
 并默认只推送由 `0xb55eDCBEc988931a1f25f541B1C09F7AB817CD9E` 发起的交易（可关闭）。
 
 - 监听的是**已确认区块**（可配置确认数），稳定性比 pending/mempool 高。
-- **数据源可切换**（`DATA_SOURCE`）：`rpc` 逐块扫描（默认，配免费公共 RPC 零成本、无需 Key、无月度额度可耗尽）、`nodereal` 免费索引 API（免费月额度较小，10 秒轮询会超额）、`ankr` Advanced API（需开通权限）、`etherscan`（付费才含 BSC）。
+- **数据源可切换**（`DATA_SOURCE`）：`rpc`（默认，配免费公共 RPC 零成本、无需 Key、无月度额度可耗尽；**nonce 省流**让空闲时每轮只有 3 次轻量调用）、`nodereal` 免费索引 API（免费月额度较小，10 秒轮询会超额）、`ankr` Advanced API（需开通权限）、`etherscan`（付费才含 BSC）。
+- **免费 RPC 首选 `https://bsc-rpc.publicnode.com`**：2026-11 实测唯一一个免 Key、所有查询都正常的公共端点（见下方「免费 RPC 实测」）。
 - 自带 Telegram 命令菜单、白名单权限控制，可拉进群使用。
 - 每个 poolId 都附 PancakeSwap 池子链接和内联按钮；`/pool` 还能读链上**当前价格**。
 - 池子信息持久化到 `pools.json`，重启后历史池子仍能显示币对。
@@ -29,6 +30,10 @@
 拉 `Initialize` 事件，`hooks` 命中 `ALPHA_HOOKS`（默认 `0xb0BAa371…434d0f`、`0xb0bb171D…aD46af`，逗号分隔，留空关闭）就推送新池，
 并缓存币对，后续开盘时间 / 加管理员消息能显示币对并回复在新池消息下。已缓存的 poolId 不会重复推送。
 单次 `eth_getLogs` 最多覆盖 `INIT_LOGS_MAX_RANGE`（默认 2000）块。`/import` 也支持这类建池交易的哈希。
+
+这一步依赖 RPC 支持 `eth_getLogs`。有的免费 RPC 不支持（如币安官方 `bsc-dataseed.binance.org` 一律返回
+`limit exceeded`）：连续 3 轮查询失败后机器人会**跳过事件扫描、继续扫交易**，不会卡住；`/status` 的
+「Initialize 事件扫描」会显示 ⚠️，这时经 CLPositionManager 建的池子收不到，换成 publicnode 即可。
 
 ### poolId 以链上事件为准（重要）
 
@@ -125,7 +130,7 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `RPC_URL` | ✅ | — | BSC RPC，建议用自己的稳定节点；公共 RPC 容易限速 |
+| `RPC_URL` | ✅ | — | BSC RPC。免费首选 `https://bsc-rpc.publicnode.com`（实测全部查询正常，见「免费 RPC 实测」） |
 | `TG_BOT_TOKEN` | ✅ | — | BotFather 给的 token |
 | `TG_CHAT_ID` | | 空 | 固定收件会话，逗号分隔多个；可留空改用动态订阅（`/subscribe`） |
 | `WHITELIST_IDS` | | 空 | 控制命令白名单（TG 用户 ID，逗号分隔）。留空 = 没人能控制 |
@@ -134,7 +139,8 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `START_BLOCK` | | 空 | 首次启动从哪个区块开始扫；留空则从最新块开始，不推历史 |
 | `POLL_MS` | | `10000` | 每隔多少毫秒查一次数据源（默认 10 秒） |
 | `DATA_SOURCE` | | `rpc` | 数据源：`rpc`（逐块扫描，配免费公共 RPC 零成本、无需 Key、无月度额度可耗尽，**推荐**）／`nodereal`（免费索引 API，但免费月额度小，10 秒轮询会超额）／`ankr`（需该 Key 开通 Advanced API 权限）／`etherscan`（免费版**不含 BSC**，需付费） |
-| `RPC_MAX_BLOCKS_PER_TICK` | | `200` | 仅 `rpc`：逐块模式单轮最多扫多少块 |
+| `NONCE_GATE` | | `1` | 仅 `rpc` 且设了 `FILTER_FROM`：nonce 省流，操作钱包没发交易就不拉区块；设 `0` 关闭（每块都拉） |
+| `RPC_MAX_BLOCKS_PER_TICK` | | `200` | 仅 `rpc`：单轮最多处理多少块 |
 | `API_MAX_BLOCKS_PER_TICK` | | `100000` | 仅 API 模式：单轮最多覆盖多少区块，防止落后太多时单轮查询过大 |
 | `NODEREAL_API_KEY` / `NODEREAL_API` | | 空 | 仅 `nodereal` |
 | `ANKR_API_KEY` | | 空 | 仅 `ankr`：Ankr API Key；留空则自动从 `RPC_URL` 提取 |
@@ -180,8 +186,17 @@ npm run format # prettier
 再按 `DATA_SOURCE` 发现监听地址（`FILTER_FROM`，未设则退回 `TARGET_CONTRACT`）在 `(上次游标, 确认后区块]`
 区间内的交易：
 
-- **`rpc`（默认，推荐）**：逐块 `eth_getBlockByNumber` 取全部交易。**无需任何 API Key**，配免费公共 RPC
-  即零成本，且**没有会被耗尽的月度额度**；缺点是链上调用较多，跑在付费计量端点上会较贵。
+- **`rpc`（默认，推荐）**：直接查 RPC。**无需任何 API Key**，配免费公共 RPC 即零成本，且**没有会被耗尽的月度额度**。
+  设了 `FILTER_FROM` 时走 **nonce 省流**：EOA 每发一笔交易 nonce 就 +1，所以每轮先比对操作钱包在
+  `上次游标` 和 `确认后区块` 两个高度的 nonce——相等就说明这段区间它一笔交易都没发、不可能命中，
+  **整段跳过、一个区块都不拉**；不相等才用 nonce 二分定位到含它交易的区块，只拉那几个块。
+  空闲时每轮只有 `eth_blockNumber` + `eth_getTransactionCount` + `eth_getLogs` 3 次轻量调用。
+  RPC 查不了那个高度的 nonce（落后太多、节点没那么早的状态，如币安官方节点只保留最近一百多块）时，
+  自动退回逐块 `eth_getBlockByNumber`，追上后自动恢复。
+
+  > BSC 现在 0.45 秒一块（每 10 秒约 22 块）。不用省流时每轮要拉约 22 个完整区块（约 2.5MB），
+  > 一天约 19 万次请求、20GB 以上流量，免费节点迟早限流；省流后一天约 2.6 万次轻量请求、几十 MB 以内的流量。
+  > 实测从落后 3000 块开始追，开省流 45 秒追平、只拉了 2 个区块；不开省流 70 秒只推进 600 块、拉了 72MB。
 - **`nodereal`**：用 NodeReal 免费索引 API `nr_getTransactionByAddress` 列出监听钱包的对外交易（含 0 值
   合约调用），再用 RPC 逐笔补全 calldata + 查回执。省 RPC，但 NodeReal **免费月额度较小**，24/7 每 10 秒
   轮询会超额（`monthly quota limit`）；要用需调大 `POLL_MS`（如 30~60 秒）或购买 CU。
@@ -194,11 +209,28 @@ npm run format # prettier
 
 - **不漏告警**：命中交易若所有会话都推送失败（含重试），会抛错使游标停在该块之前，下一轮重试。
 - **不重复 / 不漏块**：处理完成后才把游标写入 `CURSOR_FILE`；数据源拉取失败则本轮不前进游标。
+  负载均衡的公共 RPC 偶尔会把请求打到还没同步到该块的节点（区块返回 null），这也当失败处理、下轮重扫，不会当空块跳过。
 - **健壮**：所有链上 / API 调用都包了超时（`RPC_TIMEOUT_MS`），避免单个请求卡死。
 - **落后太多**：若数据源长时间失败（如 NodeReal 额度耗尽），游标会停住、`/status` 的「落后」持续增大。
   排除故障后发 **`/resync`**（不带参数=跳到链头，放弃旧积压）即可恢复实时。
 
 > 想抢跑监听“未确认 pending 交易”需要换成支持 BSC pending tx 的 WebSocket RPC，很多公共 BSC RPC 不开放完整 pending 流。
+
+### 免费 RPC 实测（2026-11）
+
+机器人用到的查询：完整区块（`eth_getBlockByNumber`）、`eth_getLogs`（Initialize 事件）、按区块高度查 nonce（省流）。
+
+| 端点（免 Key） | 完整区块 | eth_getLogs | 按区块查 nonce | 结论 |
+|---|---|---|---|---|
+| `https://bsc-rpc.publicnode.com` | ✅ | ✅ 5 万块范围也正常 | ✅ 近 1 万块 | **推荐** |
+| `https://bsc-dataseed.binance.org` | ✅ | ❌ 一律 `limit exceeded` | ✅ 仅最近一百多块 | 能用，但收不到经 CLPositionManager 建的池子 |
+| `https://bsc-mainnet.public.blastapi.io` | ✅ | ❌ 被限流 | ✅ | 同上 |
+| `https://rpc-bsc.48.club` | ✅ | ⚠️ 慢，最多 5000 块 | ❌ 只能查最新 | 链头落后几十块，不推荐 |
+| `bsc.drpc.org` / `1rpc.io/bnb` / `bsc.meowrpc.com` | 实测被限流 | | | 不推荐 |
+| `rpc.ankr.com/bsc` / BlockPI | 需要注册（免费）Key | | | 有 Key 后可作备用 |
+| `binance.llamarpc.com` / omniatech | 连不上 | | | — |
+
+部署后发 `/status` 看「nonce 省流」和「Initialize 事件扫描」两行是否都是 ✅。
 
 ## 项目结构
 

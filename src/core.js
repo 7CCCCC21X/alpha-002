@@ -126,6 +126,20 @@ export function filterAlphaInitializeLogs(logs, alphaHooks) {
   return out.sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex);
 }
 
+// nonce 闸门用：EOA 每发一笔交易（成功或失败）nonce 都 +1，所以 nonce 随区块单调不减。
+// 已知 nonceAt(lo) === n0 且 nonceAt(hi) > n0 时，在 (lo, hi] 里二分出 nonce 首次大于 n0 的区块：
+// 该块里一定有这个钱包发的交易，而 (lo, 该块-1] 里一笔都没有，不用拉区块。
+// nonceAt: async (blockNumber) => number。返回该区块号；调用 nonceAt 约 log2(hi-lo) 次。
+export async function findFirstNonceIncrease(lo, hi, n0, nonceAt) {
+  if (!(hi > lo)) throw new Error(`findFirstNonceIncrease: 区间无效 (${lo}, ${hi}]`);
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    if ((await nonceAt(mid)) > n0) hi = mid;
+    else lo = mid;
+  }
+  return hi;
+}
+
 // CLAlphaHook 自己也会 emit PoolStartedAtUpdated(bytes32 indexed poolId, uint256 startedTimestamp, address operator)
 // 里面带真实 poolId 和准确的开始时间，可作为 poolId 的备用来源 + 准确开始时间。
 export const HOOK_EVENT_ABI = [
