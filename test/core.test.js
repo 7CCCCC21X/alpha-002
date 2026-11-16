@@ -26,6 +26,7 @@ import {
   formatUiTime,
   humanizeNumberString,
   buildPoolKeyboard,
+  findFirstNonceIncrease,
   iface
 } from "../src/core.js";
 
@@ -325,5 +326,45 @@ describe("buildPoolKeyboard", () => {
   });
   it("returns undefined when nothing to show", () => {
     expect(buildPoolKeyboard({ poolId: null, txHash: "0x" + "0".repeat(64) })).toBeUndefined();
+  });
+});
+
+describe("findFirstNonceIncrease", () => {
+  // 钱包在这些区块各发了一笔交易：nonce(b) = 区块号 ≤ b 的交易数
+  const nonceFor = (txBlocks) => async (b) => txBlocks.filter((x) => x <= b).length;
+
+  it("finds the block holding the first new tx", async () => {
+    const nonceAt = nonceFor([105, 140]);
+    expect(await findFirstNonceIncrease(100, 200, 0, nonceAt)).toBe(105);
+    expect(await findFirstNonceIncrease(105, 200, 1, nonceAt)).toBe(140);
+  });
+
+  it("handles the tx sitting at either edge of the range", async () => {
+    expect(await findFirstNonceIncrease(100, 122, 0, nonceFor([101]))).toBe(101);
+    expect(await findFirstNonceIncrease(100, 122, 0, nonceFor([122]))).toBe(122);
+    expect(await findFirstNonceIncrease(100, 101, 0, nonceFor([101]))).toBe(101);
+  });
+
+  it("treats several txs in one block as one hit", async () => {
+    expect(await findFirstNonceIncrease(0, 50, 3, nonceFor([1, 2, 3, 30, 30]))).toBe(30);
+  });
+
+  it("only probes about log2(range) blocks", async () => {
+    let calls = 0;
+    const base = nonceFor([1234]);
+    const nonceAt = async (b) => {
+      calls++;
+      return base(b);
+    };
+    expect(await findFirstNonceIncrease(1000, 2000, 0, nonceAt)).toBe(1234);
+    expect(calls).toBeLessThanOrEqual(10);
+  });
+
+  it("rejects an empty range and propagates RPC errors", async () => {
+    await expect(findFirstNonceIncrease(5, 5, 0, nonceFor([]))).rejects.toThrow();
+    const failing = async () => {
+      throw new Error("missing trie node");
+    };
+    await expect(findFirstNonceIncrease(0, 10, 0, failing)).rejects.toThrow("missing trie node");
   });
 });
