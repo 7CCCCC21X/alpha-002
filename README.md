@@ -130,7 +130,7 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `RPC_URL` | ✅ | — | BSC RPC。免费首选 `https://bsc-rpc.publicnode.com`（实测全部查询正常，见「免费 RPC 实测」） |
+| `RPC_URL` | | `https://bsc-rpc.publicnode.com` | BSC RPC，可逗号分隔多个、按顺序用。末尾总会自动加 publicnode 兜底：当前 RPC 连续 3 轮读不到最新区块（Key 被停用 / 额度用完 / 宕机）就自动换下一个，不会退出。免费首选就是 publicnode（见「免费 RPC 实测」） |
 | `TG_BOT_TOKEN` | ✅ | — | BotFather 给的 token |
 | `TG_CHAT_ID` | | 空 | 固定收件会话，逗号分隔多个；可留空改用动态订阅（`/subscribe`） |
 | `WHITELIST_IDS` | | 空 | 控制命令白名单（TG 用户 ID，逗号分隔）。留空 = 没人能控制 |
@@ -138,7 +138,7 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 | `FILTER_FROM` | | `0xb55eDCBE…CD9E` | 只推这个地址发起的调用；留空 = 监听所有调用者 |
 | `START_BLOCK` | | 空 | 首次启动从哪个区块开始扫；留空则从最新块开始，不推历史 |
 | `POLL_MS` | | `10000` | 每隔多少毫秒查一次数据源（默认 10 秒） |
-| `DATA_SOURCE` | | `rpc` | 数据源：`rpc`（逐块扫描，配免费公共 RPC 零成本、无需 Key、无月度额度可耗尽，**推荐**）／`nodereal`（免费索引 API，但免费月额度小，10 秒轮询会超额）／`ankr`（需该 Key 开通 Advanced API 权限）／`etherscan`（免费版**不含 BSC**，需付费） |
+| `DATA_SOURCE` | | `rpc` | 数据源：`rpc`（逐块扫描，配免费公共 RPC 零成本、无需 Key、无月度额度可耗尽，**推荐**）／`nodereal`（免费索引 API，但免费月额度小，10 秒轮询会超额）／`ankr`（需该 Key 开通 Advanced API 权限）／`etherscan`（免费版**不含 BSC**，需付费）。API 类数据源连续 3 轮失败会自动改用 `rpc` |
 | `NONCE_GATE` | | `1` | 仅 `rpc` 且设了 `FILTER_FROM`：nonce 省流，操作钱包没发交易就不拉区块；设 `0` 关闭（每块都拉） |
 | `RPC_MAX_BLOCKS_PER_TICK` | | `200` | 仅 `rpc`：单轮最多处理多少块 |
 | `API_MAX_BLOCKS_PER_TICK` | | `100000` | 仅 API 模式：单轮最多覆盖多少区块，防止落后太多时单轮查询过大 |
@@ -159,7 +159,7 @@ https://pancakeswap.finance/liquidity/pool/bsc/<poolId>
 
 ```bash
 npm install
-cp .env.example .env   # 然后填写 RPC_URL / TG_BOT_TOKEN / TG_CHAT_ID 等
+cp .env.example .env   # 然后填写 TG_BOT_TOKEN / TG_CHAT_ID 等（RPC_URL 不填默认用免费的 publicnode）
 npm start
 
 npm test     # 运行单元测试（vitest）
@@ -174,7 +174,7 @@ npm run format # prettier
 ## 部署到 Railway
 
 1. 打开 [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo** → 选择本仓库，分支选 `claude/bsc-initpool-tg-bot-vCd1s`（或合并后的主分支）。
-2. 进入 service 的 **Variables**，按上表把变量填进去，至少需要 `RPC_URL`、`TG_BOT_TOKEN`、`TG_CHAT_ID`（建议同时设好 `WHITELIST_IDS`）。
+2. 进入 service 的 **Variables**，按上表把变量填进去，至少需要 `TG_BOT_TOKEN`、`TG_CHAT_ID`（建议同时设好 `WHITELIST_IDS`；`RPC_URL` 不填默认用免费的 publicnode）。
 3. Railway 会用 Nixpacks 自动构建并执行 `npm start`（见 `railway.json`）。这是常驻 worker，不需要配端口或域名。
 4. **持久化游标和池子缓存（推荐）**：Railway 文件系统是临时的，重启会丢失。如需持久化：
    - 在 service 的 **Data / Volumes** 挂载一个 Volume（例如挂到 `/data`）；
@@ -211,6 +211,10 @@ npm run format # prettier
 - **不重复 / 不漏块**：处理完成后才把游标写入 `CURSOR_FILE`；数据源拉取失败则本轮不前进游标。
   负载均衡的公共 RPC 偶尔会把请求打到还没同步到该块的节点（区块返回 null），这也当失败处理、下轮重扫，不会当空块跳过。
 - **健壮**：所有链上 / API 调用都包了超时（`RPC_TIMEOUT_MS`），避免单个请求卡死。
+- **RPC / 数据源自动兜底**：`RPC_URL` 连续 3 轮读不到最新区块（如 Ankr 报 `API key disabled`）会自动换到下一个 RPC
+  （末尾总有 publicnode）；启动时也会按顺序挑第一个能用的，不会因为一个 RPC 坏了就退出。`DATA_SOURCE` 为
+  nodereal / ankr / etherscan 时连续 3 轮拉取失败会自动改用 `rpc`。`/status` 会显示当前用的 RPC 和切换原因。
+  日志和报错里的 RPC 地址会自动打码（`https://rpc.ankr.com/bsc/***`），不会把 Key 打出来。
 - **落后太多**：若数据源长时间失败（如 NodeReal 额度耗尽），游标会停住、`/status` 的「落后」持续增大。
   排除故障后发 **`/resync`**（不带参数=跳到链头，放弃旧积压）即可恢复实时。
 

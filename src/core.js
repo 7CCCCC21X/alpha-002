@@ -126,6 +126,34 @@ export function filterAlphaInitializeLogs(logs, alphaHooks) {
   return out.sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex);
 }
 
+// RPC_URL 可逗号分隔多个，按顺序使用；末尾自动补上兜底 RPC（已在列表里就不重复）。
+export function parseRpcUrls(raw, fallback) {
+  const list = [...String(raw ?? "").split(","), fallback ?? ""]
+    .map((s) => s.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  return [...new Set(list)];
+}
+
+// 隐藏 RPC 地址里的 Key（日志 / /status 用）：路径里 ≥16 位的段和整个查询串换成 ***，用户名密码丢掉。
+// https://rpc.ankr.com/bsc/<key> → https://rpc.ankr.com/bsc/***
+export function maskRpcUrl(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname
+      .split("/")
+      .map((seg) => (seg.length >= 16 ? "***" : seg))
+      .join("/");
+    return `${u.protocol}//${u.host}${path === "/" ? "" : path}${u.search ? "?***" : ""}`;
+  } catch {
+    return "***";
+  }
+}
+
+// 把一段文字里出现的 URL 全部按 maskRpcUrl 打码（ethers 的报错信息里带完整请求地址，含 Key）
+export function maskUrlsInText(text) {
+  return String(text).replace(/https?:\/\/[^\s"'\\<>]+/g, (m) => maskRpcUrl(m));
+}
+
 // nonce 闸门用：EOA 每发一笔交易（成功或失败）nonce 都 +1，所以 nonce 随区块单调不减。
 // 已知 nonceAt(lo) === n0 且 nonceAt(hi) > n0 时，在 (lo, hi] 里二分出 nonce 首次大于 n0 的区块：
 // 该块里一定有这个钱包发的交易，而 (lo, 该块-1] 里一笔都没有，不用拉区块。

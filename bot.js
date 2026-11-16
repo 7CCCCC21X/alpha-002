@@ -15,6 +15,9 @@ import {
   CL_INITIALIZE_TOPIC,
   filterAlphaInitializeLogs,
   findFirstNonceIncrease,
+  parseRpcUrls,
+  maskRpcUrl,
+  maskUrlsInText,
   isValidPoolId,
   pancakePoolUrl,
   bscscanAddressUrl,
@@ -94,7 +97,6 @@ function communityFooter() {
   return `\n\n👥 加入<a href="${COMMUNITY_URL}">${escapeHtml(COMMUNITY_NAME)}</a> 获取最新币安Alpha消息`;
 }
 
-if (!RPC_URL) throw new Error("缺少 RPC_URL");
 if (!TG_BOT_TOKEN) throw new Error("缺少 TG_BOT_TOKEN");
 
 // 环境变量里固定配置的告警会话（始终接收）
@@ -116,9 +118,51 @@ const whitelist = new Set(
 const rpcTimeoutMs = Number(RPC_TIMEOUT_MS) || 15000;
 const confirmations = Math.max(0, Number(CONFIRMATIONS) || 0);
 
-// staticNetwork：启动时查一次 chainId 后就不再查。默认每次 getLogs / getTransaction 等都会附带
-// 一次 eth_chainId 检测网络是否变了，白白多占公共 RPC 的限流额度。
-const provider = new ethers.JsonRpcProvider(RPC_URL, undefined, { staticNetwork: true });
+// 免费公共 RPC（2026-11 实测免 Key、所有查询都正常）：RPC_URL 没填时就用它，填了别的也拿它兜底。
+const PUBLIC_BSC_RPC = "https://bsc-rpc.publicnode.com";
+// RPC 列表：RPC_URL（可逗号分隔多个）按顺序用，末尾自动加 PUBLIC_BSC_RPC。
+// 当前 RPC 连续出错（Key 被停用 / 额度用完 / 限流 / 宕机）就自动换下一个，不会因为一个 RPC 坏了整个机器人退出。
+const rpcUrls = parseRpcUrls(RPC_URL, PUBLIC_BSC_RPC);
+let rpcIndex = 0;
+let rpcSwitches = 0; // 自动切换次数
+let lastRpcSwitch = null; // { from, to, reason }
+let rpcFailStreak = 0; // 每轮开头读最新区块连续失败的次数
+let lastRpcError = null;
+
+// 链固定为 BSC(56) + staticNetwork：ethers 不做网络自动探测。RPC 坏了时请求直接报错，
+// 而不是每秒重试探测、请求一直挂着；也不会每次请求附带一次 eth_chainId 白占限流额度。
+// 真实 chainId 由 probeChainId() 主动核对。
+function makeProvider(url) {
+  return new ethers.JsonRpcProvider(url, 56, { staticNetwork: true });
+}
+let provider = makeProvider(rpcUrls[0]);
+
+function currentRpcLabel() {
+  return maskRpcUrl(rpcUrls[rpcIndex]);
+}
+
+// 换到列表里的下一个 RPC；列表只有一个时返回 false
+function switchRpc(reason) {
+  if (rpcUrls.length < 2) return false;
+  const from = currentRpcLabel();
+  const old = provider;
+  rpcIndex = (rpcIndex + 1) % rpcUrls.length;
+  provider = makeProvider(rpcUrls[rpcIndex]);
+  try {
+    old.destroy();
+  } catch {}
+  rpcSwitches++;
+  lastRpcSwitch = { from, to: currentRpcLabel(), reason };
+  console.warn(`⚠️ RPC ${from} 不可用（${reason}），已自动改用 ${currentRpcLabel()}`);
+  return true;
+}
+
+// 向当前 RPC 真正查一次 chainId（provider 是静态网络，getNetwork() 不会发请求）
+async function probeChainId() {
+  rpcCalls++;
+  const hex = await withTimeout(provider.send("eth_chainId", []), rpcTimeoutMs, "eth_chainId");
+  return BigInt(hex);
+}
 // 限定的合约集合（小写）。空 = 不限合约。
 const targetContracts = new Set(
   String(TARGET_CONTRACT)
@@ -142,14 +186,19 @@ const SAMPLE_HOOK = [...targetContracts][0] || "0xb0BAa371b899950B4Ef6A27c21bAf5
 
 // 数据源：nodereal（免费索引 API，推荐）| rpc（逐块扫描）| ankr（Advanced API）| etherscan（V2 txlist）
 const _ds = String(DATA_SOURCE).trim().toLowerCase();
-const dataSource = ["rpc", "ankr", "etherscan", "nodereal"].includes(_ds) ? _ds : "rpc";
+// API 数据源（nodereal/ankr/etherscan）连续失败时会自动改成 rpc，所以是 let
+let dataSource = ["rpc", "ankr", "etherscan", "nodereal"].includes(_ds) ? _ds : "rpc";
+let dataSourceFallback = null; // { from, reason }：API 数据源自动改用 rpc 的记录
+let apiFailStreak = 0; // API 数据源连续拉取失败次数
 // 逐块模式单轮最多扫多少块（须高于出块速度以清积压；BSC 0.45 秒一块，约 22 块/10 秒）
 const rpcMaxBlocksPerTick = Math.max(1, Number(RPC_MAX_BLOCKS_PER_TICK) || 200);
 // nonce 闸门：只有盯钱包（FILTER_FROM）时才成立——命中条件要求 From 是该钱包，钱包没发交易就不可能命中
-const nonceGateEnabled =
-  dataSource === "rpc" &&
-  Boolean(filterFrom) &&
-  !["0", "false", "off", "no"].includes(String(NONCE_GATE).trim().toLowerCase());
+const nonceGateFlag = !["0", "false", "off", "no"].includes(
+  String(NONCE_GATE).trim().toLowerCase()
+);
+function nonceGateOn() {
+  return dataSource === "rpc" && Boolean(filterFrom) && nonceGateFlag;
+}
 // API 模式单轮最多覆盖多少区块（防止落后太多时单轮查询范围过大、把额度一次打爆）
 const apiMaxBlocksPerTick = Math.max(1000, Number(API_MAX_BLOCKS_PER_TICK) || 100000);
 
@@ -178,17 +227,30 @@ const DATA_SOURCE_LABELS = {
   nodereal: "NodeReal Enhanced API",
   ankr: "Ankr Advanced API",
   etherscan: explorerHost,
-  rpc: "RPC 逐块扫描"
+  rpc: "RPC"
 };
-const dataSourceLabel = DATA_SOURCE_LABELS[dataSource];
-const dataSourceKeyMissing =
-  dataSource === "nodereal"
+function dataSourceLabel() {
+  return DATA_SOURCE_LABELS[dataSource];
+}
+function dataSourceKeyMissing() {
+  return dataSource === "nodereal"
     ? !noderealKey
     : dataSource === "ankr"
       ? !ankrKey
       : dataSource === "etherscan"
         ? !explorerKey
         : false;
+}
+
+// API 数据源连续失败（Key 被停用 / 额度用完 / 免费版不支持 BSC 等）：自动改用 rpc（nonce 省流），别让告警断掉
+function fallbackToRpcSource(reason) {
+  if (dataSource === "rpc") return;
+  dataSourceFallback = { from: DATA_SOURCE_LABELS[dataSource], reason };
+  console.warn(
+    `⚠️ 数据源 ${DATA_SOURCE_LABELS[dataSource]} 连续失败（${reason}），已自动改用 RPC（nonce 省流）`
+  );
+  dataSource = "rpc";
+}
 
 // 轮询交易的地址：优先盯操作钱包(From)；未设钱包则退回盯目标合约。
 const watchAddresses = filterFrom ? [filterFrom] : [...targetContracts];
@@ -249,11 +311,16 @@ let pendingResync = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ethers 的 RPC 报错很长（could not coalesce error (error={...}, payload={...})），取节点原话便于看
+// ethers 的 RPC 报错很长（could not coalesce error (error={...}, payload={...})），取节点原话便于看。
+// HTTP 层报错（401 / 403 / 429 等）的 message 里带完整请求地址（含 Key），只取状态和响应内容，并给 URL 打码。
 function rpcErrorMessage(err) {
   const e = err?.error;
   if (e?.message) return e.code != null ? `${e.message} (code ${e.code})` : String(e.message);
-  return err?.shortMessage || err?.message || String(err);
+  const body = err?.info?.responseBody;
+  if (err?.shortMessage && typeof body === "string" && body.trim()) {
+    return maskUrlsInText(`${err.shortMessage}: ${body.trim().slice(0, 200)}`);
+  }
+  return maskUrlsInText(err?.shortMessage || err?.message || String(err));
 }
 
 function withTimeout(promise, ms, label = "operation") {
@@ -368,7 +435,7 @@ async function getCurrentPoolPrice(poolInfo) {
     const price = formatPrices(sqrtPriceX96, poolInfo.token0.decimals, poolInfo.token1.decimals);
     return { sqrtPriceX96: sqrtPriceX96.toString(), tick: tick.toString(), price };
   } catch (err) {
-    console.error("getSlot0 失败:", err?.message || err);
+    console.error("getSlot0 失败:", rpcErrorMessage(err));
     return null;
   }
 }
@@ -763,7 +830,7 @@ async function buildImportResult(txHash) {
   try {
     tx = await withTimeout(provider.getTransaction(txHash), rpcTimeoutMs, "getTransaction");
   } catch (err) {
-    return { text: `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>` };
+    return { text: `❌ 查询交易失败：<code>${escapeHtml(rpcErrorMessage(err))}</code>` };
   }
   if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
   // 不是 Hook.initializePool 的建池交易（如经 CLPositionManager 建池）：按回执里的 Initialize 事件导入
@@ -792,7 +859,7 @@ async function buildImportResult(txHash) {
       ].join("\n");
       return { text, reply_markup: built.reply_markup };
     } catch (err) {
-      return { text: `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>` };
+      return { text: `❌ 解析失败：<code>${escapeHtml(rpcErrorMessage(err))}</code>` };
     }
   }
   if (!isWatchedContract(tx.to)) {
@@ -818,7 +885,7 @@ async function buildImportResult(txHash) {
     ].join("\n");
     return { text, reply_markup: built.reply_markup };
   } catch (err) {
-    return { text: `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>` };
+    return { text: `❌ 解析失败：<code>${escapeHtml(rpcErrorMessage(err))}</code>` };
   }
 }
 
@@ -855,7 +922,7 @@ async function buildPreviewForTx(txHash) {
   try {
     tx = await withTimeout(provider.getTransaction(txHash), rpcTimeoutMs, "getTransaction");
   } catch (err) {
-    return { text: `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>` };
+    return { text: `❌ 查询交易失败：<code>${escapeHtml(rpcErrorMessage(err))}</code>` };
   }
   if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
   if (!isWatchedContract(tx.to)) {
@@ -880,7 +947,7 @@ async function buildPreviewForTx(txHash) {
     const m = await buildMessageForMethod(method, tx, tx.blockNumber ?? "pending", parsed, receipt);
     return { text: `🔎 <b>预览（真实交易）</b>\n\n${m.text}`, reply_markup: m.reply_markup };
   } catch (err) {
-    return { text: `❌ 解析失败：<code>${escapeHtml(err?.message || err)}</code>` };
+    return { text: `❌ 解析失败：<code>${escapeHtml(rpcErrorMessage(err))}</code>` };
   }
 }
 
@@ -893,7 +960,7 @@ async function buildHitCheck(txHash) {
   try {
     tx = await withTimeout(provider.getTransaction(txHash), rpcTimeoutMs, "getTransaction");
   } catch (err) {
-    return { text: `❌ 查询交易失败：<code>${escapeHtml(err?.message || err)}</code>` };
+    return { text: `❌ 查询交易失败：<code>${escapeHtml(rpcErrorMessage(err))}</code>` };
   }
   if (!tx) return { text: `❌ 找不到该交易：<code>${escapeHtml(txHash)}</code>` };
 
@@ -1006,11 +1073,15 @@ async function buildStatusMessage() {
   try {
     latestRaw = await withTimeout(provider.getBlockNumber(), rpcTimeoutMs, "getBlockNumber");
     lastRpcLatencyMs = Date.now() - t0;
-    chainId = (
-      await withTimeout(provider.getNetwork(), rpcTimeoutMs, "getNetwork")
-    ).chainId.toString();
+    chainId = (await probeChainId()).toString();
   } catch (err) {
-    return `⚠️ 读取链上状态失败: <code>${escapeHtml(err?.message || err)}</code>`;
+    return [
+      `⚠️ 读取链上状态失败（RPC <code>${escapeHtml(currentRpcLabel())}</code>）:`,
+      `<code>${escapeHtml(rpcErrorMessage(err))}</code>`,
+      rpcUrls.length > 1
+        ? `连续失败 3 轮会自动换下一个 RPC（共 ${rpcUrls.length} 个）。`
+        : `建议把 RPC_URL 改成 <code>${PUBLIC_BSC_RPC}</code>。`
+    ].join("\n");
   }
   const confirmed = Math.max(0, latestRaw - confirmations);
   const cursor = await readCursor();
@@ -1038,7 +1109,18 @@ async function buildStatusMessage() {
     `<b>已扫描到:</b> <code>${cursor ?? "未初始化"}</code>`,
     `<b>落后:</b> <code>${lag}</code> 块`,
     `<b>检查间隔:</b> <code>${Number(POLL_MS) / 1000}</code> 秒`,
-    `<b>数据源:</b> <code>${escapeHtml(dataSourceLabel)}</code>${dataSourceKeyMissing ? " ⚠️无Key" : ""}`,
+    `<b>数据源:</b> <code>${escapeHtml(dataSourceLabel())}</code>${dataSourceKeyMissing() ? " ⚠️无Key" : ""}${
+      dataSourceFallback
+        ? `｜⚠️ 原 ${escapeHtml(dataSourceFallback.from)} 连续失败已自动改用：${escapeHtml(dataSourceFallback.reason)}`
+        : ""
+    }`,
+    `<b>RPC:</b> <code>${escapeHtml(currentRpcLabel())}</code>${
+      rpcUrls.length > 1 ? `（共 ${rpcUrls.length} 个，出错自动切换）` : ""
+    }${
+      lastRpcSwitch
+        ? `｜⚠️ 已自动切换 ${rpcSwitches} 次，最近从 <code>${escapeHtml(lastRpcSwitch.from)}</code> 切走：${escapeHtml(lastRpcSwitch.reason)}`
+        : ""
+    }`,
     `<b>数据源延迟:</b> <code>${lastExplorerLatencyMs ?? "?"}</code> ms${
       lastExplorerError ? `｜⚠️ ${escapeHtml(lastExplorerError)}` : ""
     }`,
@@ -1055,7 +1137,7 @@ async function buildStatusMessage() {
     ...(dataSource === "rpc"
       ? [
           `<b>nonce 省流:</b> ${
-            !nonceGateEnabled
+            !nonceGateOn()
               ? `关闭（${filterFrom ? "NONCE_GATE=0" : "未设 FILTER_FROM"}，每块都拉）`
               : lastNonceGateError
                 ? `⚠️ 退回逐块扫描：${escapeHtml(lastNonceGateError)}`
@@ -1090,13 +1172,15 @@ async function runConnectivityTest() {
   const t0 = Date.now();
   try {
     const latest = await withTimeout(provider.getBlockNumber(), rpcTimeoutMs, "getBlockNumber");
-    const net = await withTimeout(provider.getNetwork(), rpcTimeoutMs, "getNetwork");
+    const chainId = await probeChainId();
     lines.push(
-      `✅ RPC 正常：最新区块 <code>${latest}</code>，chainId <code>${net.chainId}</code>（${Date.now() - t0}ms）`
+      `✅ RPC 正常（<code>${escapeHtml(currentRpcLabel())}</code>）：最新区块 <code>${latest}</code>，chainId <code>${chainId}</code>（${Date.now() - t0}ms）`
     );
-    if (net.chainId !== 56n) lines.push(`⚠️ chainId 不是 56，可能不是 BSC 主网。`);
+    if (chainId !== 56n) lines.push(`⚠️ chainId 不是 56，可能不是 BSC 主网。`);
   } catch (err) {
-    lines.push(`❌ RPC 失败：<code>${escapeHtml(err?.message || err)}</code>`);
+    lines.push(
+      `❌ RPC 失败（<code>${escapeHtml(currentRpcLabel())}</code>）：<code>${escapeHtml(rpcErrorMessage(err))}</code>`
+    );
   }
   const recipients = recipientChatIds();
   let okCount = 0;
@@ -1164,7 +1248,7 @@ async function buildResync(arg) {
     const latestRaw = await withTimeout(provider.getBlockNumber(), rpcTimeoutMs, "getBlockNumber");
     head = Math.max(0, latestRaw - confirmations);
   } catch (err) {
-    return `❌ 读取最新区块失败，无法重置：<code>${escapeHtml(err?.message || err)}</code>`;
+    return `❌ 读取最新区块失败，无法重置：<code>${escapeHtml(rpcErrorMessage(err))}</code>`;
   }
   let target;
   if (arg != null && String(arg).trim() !== "") {
@@ -1383,14 +1467,14 @@ async function pollTelegram() {
           try {
             await handleUpdate(upd);
           } catch (err) {
-            console.error("处理更新出错:", err?.message || err);
+            console.error("处理更新出错:", rpcErrorMessage(err));
           }
         }
       } else {
         await sleep(2000);
       }
     } catch (err) {
-      console.error("getUpdates 循环异常:", err?.message || err);
+      console.error("getUpdates 循环异常:", rpcErrorMessage(err));
       await sleep(3000);
     }
   }
@@ -1483,10 +1567,11 @@ async function ankrTxList(address, startBlock, endBlock) {
       signal: AbortSignal.timeout(rpcTimeoutMs)
     });
     const data = await res.json().catch(() => ({}));
-    if (data.error) {
-      throw new Error(
-        `Ankr Advanced API 异常：${data.error.message || JSON.stringify(data.error)}`
-      );
+    if (data.error || !res.ok) {
+      const detail = data.error
+        ? data.error.message || JSON.stringify(data.error)
+        : `HTTP ${res.status}`;
+      throw new Error(`Ankr Advanced API 异常：${detail}`);
     }
     const result = data.result || {};
     const rows = Array.isArray(result.transactions) ? result.transactions : [];
@@ -1528,8 +1613,11 @@ async function noderealTxList(address, startBlock, endBlock) {
       signal: AbortSignal.timeout(rpcTimeoutMs)
     });
     const data = await res.json().catch(() => ({}));
-    if (data.error) {
-      throw new Error(`NodeReal 异常：${data.error.message || JSON.stringify(data.error)}`);
+    if (data.error || !res.ok) {
+      const detail = data.error
+        ? data.error.message || JSON.stringify(data.error)
+        : `HTTP ${res.status}`;
+      throw new Error(`NodeReal 异常：${detail}`);
     }
     const result = data.result || {};
     const transfers = Array.isArray(result.transfers) ? result.transfers : [];
@@ -1731,7 +1819,7 @@ async function tickRpcNonceGated(cursor, toBlock) {
         await scanBlockRpc(b);
       } catch (err) {
         // 该块推送失败 / 没拉到：游标停在 b-1，下一轮重扫本块，避免漏告警
-        console.error(`扫块 ${b} 处理失败，游标不前进:`, err?.message || err);
+        console.error(`扫块 ${b} 处理失败，游标不前进:`, rpcErrorMessage(err));
         return { done: true };
       }
       await writeCursor(b);
@@ -1766,7 +1854,7 @@ async function tickRpcLinear(cursor, toBlock) {
       processedThrough = n;
     } catch (err) {
       // 该块推送失败 / 没拉到：游标停在上一块，下一轮重扫本块，避免漏告警
-      console.error(`扫块 ${n} 处理失败，游标不前进:`, err?.message || err);
+      console.error(`扫块 ${n} 处理失败，游标不前进:`, rpcErrorMessage(err));
       break;
     }
   }
@@ -1776,7 +1864,7 @@ async function tickRpcLinear(cursor, toBlock) {
 // DATA_SOURCE=rpc 的 tick 分支：处理 (cursor, toBlock]（toBlock 已按 rpcMaxBlocksPerTick 截断）
 async function tickRpc(cursor, toBlock) {
   lastFetchCount = toBlock - cursor; // 本轮覆盖的块数
-  if (nonceGateEnabled) {
+  if (nonceGateOn()) {
     const r = await tickRpcNonceGated(cursor, toBlock);
     if (r.done) return;
     cursor = r.cursor;
@@ -1825,9 +1913,13 @@ async function tickApi(cursor, latest) {
   try {
     candidates = await fetchCandidateTxs(cursor + 1, toBlock);
     lastExplorerError = null;
+    apiFailStreak = 0;
   } catch (err) {
-    lastExplorerError = err?.message || String(err);
-    console.error("数据源拉取失败，本轮游标不前进:", lastExplorerError);
+    lastExplorerError = maskUrlsInText(err?.message || String(err));
+    apiFailStreak++;
+    console.error(`数据源拉取失败（连续 ${apiFailStreak} 次），本轮游标不前进:`, lastExplorerError);
+    // 连续 3 轮失败（Key 被停用 / 额度用完 / 免费版不含 BSC）：自动改用 rpc，下一轮起照常扫
+    if (apiFailStreak >= 3) fallbackToRpcSource(lastExplorerError);
     return;
   }
 
@@ -1846,7 +1938,7 @@ async function tickApi(cursor, latest) {
     try {
       await processMatchedTx(tx);
     } catch (err) {
-      console.error("处理命中交易失败，游标不前进:", err?.message || err);
+      console.error("处理命中交易失败，游标不前进:", rpcErrorMessage(err));
       processedThrough = Number(tx.blockNumber) - 1;
       break;
     }
@@ -1871,7 +1963,22 @@ async function tick() {
     }
     const t0 = Date.now();
     rpcCalls++;
-    const latestRaw = await withTimeout(provider.getBlockNumber(), rpcTimeoutMs, "getBlockNumber");
+    let latestRaw;
+    try {
+      latestRaw = await withTimeout(provider.getBlockNumber(), rpcTimeoutMs, "getBlockNumber");
+      rpcFailStreak = 0;
+      lastRpcError = null;
+    } catch (err) {
+      // 连续 3 轮连最新区块都读不到 = 当前 RPC 不可用（Key 被停用 / 额度用完 / 宕机），自动换下一个
+      rpcFailStreak++;
+      lastRpcError = rpcErrorMessage(err);
+      console.error(
+        `读取最新区块失败（${currentRpcLabel()}，连续 ${rpcFailStreak} 次）:`,
+        lastRpcError
+      );
+      if (rpcFailStreak >= 3 && switchRpc(lastRpcError)) rpcFailStreak = 0;
+      return;
+    }
     lastRpcLatencyMs = Date.now() - t0;
     const latest = Math.max(0, latestRaw - confirmations);
 
@@ -1900,7 +2007,7 @@ async function tick() {
     else await tickApi(cursor, toBlock);
     if (toBlock < latest) console.log(`还有区块积压: 本轮到 ${toBlock}, latest=${latest}`);
   } catch (err) {
-    console.error("tick 错误:", err?.message || err);
+    console.error("tick 错误:", rpcErrorMessage(err));
   } finally {
     lastTickRpc = rpcCalls - rpcBefore;
     lastTickApi = apiCalls - apiBefore;
@@ -1911,9 +2018,30 @@ async function tick() {
 async function main() {
   await loadPools();
   await loadSubscribers();
-  const network = await provider.getNetwork();
+  // 按顺序挑第一个能用的 RPC：RPC_URL 的 Key 被停用 / 额度用完 / 宕机时自动换兜底，不再直接退出。
+  // 全都连不上也照常启动（Telegram 命令可用），每轮会继续重试、轮换。
+  let chainId = null;
+  for (let i = 0; i < rpcUrls.length; i++) {
+    try {
+      chainId = await probeChainId();
+      break;
+    } catch (err) {
+      lastRpcError = rpcErrorMessage(err);
+      console.error(`RPC ${currentRpcLabel()} 不可用:`, lastRpcError);
+      if (i < rpcUrls.length - 1) switchRpc(lastRpcError);
+    }
+  }
+  if (chainId !== null) lastRpcError = null;
   console.log("BSC Initialize Pool / Add Pool Owners TG Bot started");
-  console.log("chainId:", network.chainId.toString());
+  console.log(
+    "rpc:",
+    currentRpcLabel(),
+    rpcUrls.length > 1 ? `（共 ${rpcUrls.length} 个，出错自动切换）` : ""
+  );
+  console.log(
+    "chainId:",
+    chainId === null ? "未知（RPC 暂时都连不上，会持续重试）" : chainId.toString()
+  );
   console.log(
     "targetContracts:",
     targetContracts.size === 0 ? "(any)" : [...targetContracts].join(", ")
@@ -1926,11 +2054,11 @@ async function main() {
   });
   console.log("cursorFile:", CURSOR_FILE, "| poolsFile:", POOLS_FILE);
   console.log("pollMs:", POLL_MS, "| confirmations:", confirmations);
-  console.log("dataSource:", dataSourceLabel, dataSourceKeyMissing ? "(NO KEY ⚠️)" : "(with key)");
+  console.log("dataSource:", dataSourceLabel() + (dataSourceKeyMissing() ? " (NO KEY ⚠️)" : ""));
   if (dataSource === "rpc") {
     console.log(
       "nonceGate:",
-      nonceGateEnabled ? "on（钱包没发交易就不拉区块）" : "off（每块都拉完整区块）"
+      nonceGateOn() ? "on（钱包没发交易就不拉区块）" : "off（每块都拉完整区块）"
     );
   }
   console.log("watchAddresses:", watchAddresses.length ? watchAddresses.join(", ") : "(none)");
@@ -1946,7 +2074,9 @@ async function main() {
   if (recipientChatIds().length === 0) {
     console.warn("提示：当前没有任何收件会话。设置 TG_CHAT_ID 或在群里发 /subscribe。");
   }
-  if (network.chainId !== 56n) console.warn("警告：当前 RPC chainId 不是 56，可能不是 BSC 主网。");
+  if (chainId !== null && chainId !== 56n) {
+    console.warn("警告：当前 RPC chainId 不是 56，可能不是 BSC 主网。");
+  }
 
   try {
     await setupTelegram();
@@ -1960,6 +2090,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  // 打码：ethers 报错里带完整 RPC 地址（含 Key）
+  console.error(maskUrlsInText(err?.stack || err));
   process.exit(1);
 });

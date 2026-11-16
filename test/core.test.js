@@ -27,6 +27,9 @@ import {
   humanizeNumberString,
   buildPoolKeyboard,
   findFirstNonceIncrease,
+  parseRpcUrls,
+  maskRpcUrl,
+  maskUrlsInText,
   iface
 } from "../src/core.js";
 
@@ -366,5 +369,45 @@ describe("findFirstNonceIncrease", () => {
       throw new Error("missing trie node");
     };
     await expect(findFirstNonceIncrease(0, 10, 0, failing)).rejects.toThrow("missing trie node");
+  });
+});
+
+describe("RPC url helpers", () => {
+  const PUB = "https://bsc-rpc.publicnode.com";
+  const KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+  it("appends the public fallback once, keeping order", () => {
+    expect(parseRpcUrls(`https://rpc.ankr.com/bsc/${KEY}`, PUB)).toEqual([
+      `https://rpc.ankr.com/bsc/${KEY}`,
+      PUB
+    ]);
+    expect(parseRpcUrls(` ${PUB}/ , https://bsc-dataseed.binance.org`, PUB)).toEqual([
+      PUB,
+      "https://bsc-dataseed.binance.org"
+    ]);
+  });
+
+  it("falls back to the public RPC when RPC_URL is empty or missing", () => {
+    expect(parseRpcUrls("", PUB)).toEqual([PUB]);
+    expect(parseRpcUrls(undefined, PUB)).toEqual([PUB]);
+  });
+
+  it("hides keys in RPC urls", () => {
+    expect(maskRpcUrl(`https://rpc.ankr.com/bsc/${KEY}`)).toBe("https://rpc.ankr.com/bsc/***");
+    expect(maskRpcUrl("https://bsc-mainnet.nodereal.io/v1/0123456789abcdef0123456789abcdef")).toBe(
+      "https://bsc-mainnet.nodereal.io/v1/***"
+    );
+    expect(maskRpcUrl("https://x.example/rpc?apikey=secret")).toBe("https://x.example/rpc?***");
+    expect(maskRpcUrl("https://user:pass@x.example/bsc")).toBe("https://x.example/bsc");
+    expect(maskRpcUrl(PUB)).toBe(PUB);
+    expect(maskRpcUrl("https://1rpc.io/bnb")).toBe("https://1rpc.io/bnb");
+    expect(maskRpcUrl("not a url")).toBe("***");
+  });
+
+  it("masks urls inside ethers error text", () => {
+    const msg = `server response 401 Unauthorized (info={ "requestUrl": "https://rpc.ankr.com/bsc/${KEY}" })`;
+    const out = maskUrlsInText(msg);
+    expect(out).not.toContain(KEY);
+    expect(out).toContain("https://rpc.ankr.com/bsc/***");
   });
 });
